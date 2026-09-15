@@ -17,15 +17,18 @@ A **pi extension** with canonical entrypoint `.pi/extensions/pi-workflow-engine/
 
 ## What this extension does
 
-`.pi/extensions/pi-workflow-engine/index.ts` registers five surfaces:
+`.pi/extensions/pi-workflow-engine/index.ts` registers these primary surfaces:
 - `/workflow <name> [args]` — slash command to run a saved workflow.
 - `/workflow:inspector [last]` — opens the live or most recently completed workflow inspector.
 - `/workflow:results` — reopens the most recent code-review findings without rerunning the workflow.
+- `/workflow:runs`, `/workflow:resume`, and `/workflow:answer` — inspect/resume durable runs and answer owner gates.
 - `/workflow:dynamax on|off|status` plus the literal `dynamax` token — opt-in signals for host-agent workflow orchestration.
 - a `workflow` tool — lets the host agent run a saved workflow by `name` or a one-off inline workflow by `script` mid-conversation.
 
 A **workflow** (`.pi/extensions/pi-workflow-engine/workflows/*.ts`) exports `meta` + a default `async (api) => result`. The injected `api`:
-- `agent(prompt, { schema?, profile?, model?, thinkingLevel?, tools?, label?, phase? })` — runs one subagent; with a typebox `schema` it returns validated structured data, else final text.
+- `agent(prompt, { schema?, profile?, model?, thinkingLevel?, tools?, writeAllow?, label?, phase? })` — runs one subagent; with a typebox `schema` it returns validated structured data, else final text. `writeAllow` restricts `edit`, `write`, and recognizable bash mutations to workspace-relative globs.
+- `run(command, { effect, ... })`, `now()`, `random()`, `uuid()`, and `artifact(name, content)` — journaled deterministic/effect primitives.
+- `gate(name, { review, ... })` — digest-bound durable owner approval; cancellation or headless execution pauses rather than approving.
 - `parallel(thunks)` — concurrent barrier; recoverable failures become `null` slots and survivors continue.
 - `pipeline(items, ...stages)` — each item through all stages independently; recoverable item failures become `null`, with no barrier between stages.
 - `phase(title)` / `log(msg)` — drive the live progress tree.
@@ -38,6 +41,10 @@ Example: `.pi/extensions/pi-workflow-engine/workflows/code-review.ts` — Scope 
 - `.pi/extensions/pi-workflow-engine/src/agent-runner.ts` — **the bridge**. Each `agent()` is an in-process `createAgentSession(... SessionManager.inMemory())`. Structured output = one **terminating tool** whose `parameters` IS the schema; pi validates the call, `execute` captures the args in a closure, `terminate: true` ends the turn. No event parsing.
 - `.pi/extensions/pi-workflow-engine/src/concurrency.ts` — `Semaphore` (the single global concurrency cap, acquired inside every `agent()`), `parallel`, `pipeline`.
 - `.pi/extensions/pi-workflow-engine/src/engine.ts` — `runWorkflow()` binds the primitives to one run (shared semaphore + progress tracker). `DEFAULT_CONCURRENCY` lives here.
+- `.pi/extensions/pi-workflow-engine/src/recorded.ts` + `journal.ts` — one root-run sequence allocator and the v2 recorded-call journal shared by agents, effects, nondeterminism, artifacts, and gates.
+- `.pi/extensions/pi-workflow-engine/src/run-step.ts`, `artifact.ts`, and `gate.ts` — recorded shell steps, durable artifacts, and owner-gate validation/pause contracts.
+- `.pi/extensions/pi-workflow-engine/src/write-allow.ts` — per-agent write policy and tool-call interception.
+- `.pi/extensions/pi-workflow-engine/src/workflow-run-record.ts` + `workflow-run-store.ts` — atomic durable lifecycle records, recorded position, and pause payloads.
 - `.pi/extensions/pi-workflow-engine/src/progress.ts` — live phase/agent tree via `ctx.ui.setWidget`; stderr breadcrumbs when headless.
 - `.pi/extensions/pi-workflow-engine/src/discovery.ts` + `.pi/extensions/pi-workflow-engine/src/workflows.ts` — static registry (`BUILTIN_WORKFLOWS`) plus best-effort dynamic drop-in loading.
 - `.pi/extensions/pi-workflow-engine/src/inline-workflow.ts` — inline workflow compiler (`script` string → `WorkflowModule`) with pure-literal `export const meta` extraction and injected Type schemas.
@@ -50,7 +57,11 @@ Example: `.pi/extensions/pi-workflow-engine/workflows/code-review.ts` — Scope 
 - **At runtime, pi resolves those bare imports to its bundled copies via jiti `virtualModules`** (bun-binary mode: `virtualModules` + `tryNative:false`), intercepting before `node_modules` — so there is no dual-package hazard regardless of what's installed locally.
 - **`jiti` is NOT a virtual module.** A dynamically `import()`-ed drop-in workflow may resolve a *different* `typebox` than pi's bundled one, breaking schema validation. **Therefore guaranteed workflows must be statically imported and registered in `.pi/extensions/pi-workflow-engine/src/workflows.ts`** (they ride pi's jiti and share its typebox). Dynamic discovery is best-effort only.
 - **Inline workflow scripts must never use `import`/dynamic `import()`.** They compile in-process via `AsyncFunction` and receive the extension's injected Type value so `agent({ schema })` preserves pi's bundled TypeBox identity. The `export const meta` block must stay a pure literal so metadata can be validated before untrusted code runs.
-- **Inline workflow bodies must execute in the same VM as the extension.** `agent()` closes over live `RunContext` handles (`Semaphore`, `ProgressTracker`, model registry, abort signal); subprocess/stdin execution cannot access those handles without building a second orchestration system.
+- **Inline workflow bodies must execute in the same VM as the extension.** `agent()` and the recorded primitives close over live `RunContext` handles (`Semaphore`, `WorkflowRecorder`, `ProgressTracker`, model registry, abort signal); subprocess/stdin execution cannot access those handles without building a second orchestration system.
+- **Every replayable/effectful workflow primitive must reserve its journal sequence synchronously before starting asynchronous work.** Strict resume is sequence + kind + key; only explicit edited-workflow resume permits key fallback. Preserve compatibility with v2 agent entries that omit `kind`/`sequence`.
+- **Never silently rerun a missing `run(..., { effect: "manual" })` during resume.** It requires the separate explicit `resumeRerunEffects` opt-in; a journal hit is safe and does not need the opt-in.
+- **Owner gates never default to approval.** Decisions are bound to the canonical review digest; UI cancel, timeout, and headless execution create a durable paused run. `/workflow:answer` appends the external decision to the source journal before starting a fresh resumed run.
+- **`writeAllow` is defense-in-depth, not a shell sandbox.** Direct tool paths are canonicalized against the session workspace (the disposable worktree for isolated agents); recognized shell mutations are best-effort and refusals must remain visible to the subagent and progress log.
 - **Set `profile` per `agent()` stage.** Use `small`, `medium`, or `big` so users can centrally configure exact model/effort routes; reserve `model` and `thinkingLevel` for intentional per-call overrides.
 - **`pi install` runs `npm install`** (not bun). `bun.lock` is for local dev only.
 - Never bundle the core packages. Never use `as any` — use typebox `Static<>` and structural narrowing.

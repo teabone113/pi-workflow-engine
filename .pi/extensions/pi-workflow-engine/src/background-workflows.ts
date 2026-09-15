@@ -362,7 +362,10 @@ export function backgroundResultDetails(record: WorkflowRunRecord): BackgroundWo
 }
 
 function backgroundSummary(record: WorkflowRunRecord): string {
-  if (record.state !== "completed") return boundedSummary(`Workflow ${record.state}: ${record.message}`);
+  if (record.state !== "completed") {
+    const position = `phase ${record.currentPhase ?? record.progress.currentPhase}, recorded sequence ${record.highestSequence ?? 0}`;
+    return boundedSummary(`Workflow ${record.state} at ${position}: ${record.message}`);
+  }
   if (record.result.kind === "unavailable") {
     return boundedSummary(`Workflow completed; retained result is unavailable: ${record.result.reason}`);
   }
@@ -418,6 +421,7 @@ async function forcePausedRecord(store: WorkflowRunStore, runId: string): Promis
     state: "paused",
     progress: record.progress,
     message: "Workflow paused because its host session shut down",
+    reason: "interrupted:session-shutdown",
   }));
 }
 
@@ -454,6 +458,7 @@ async function reconcileInterruptedRun(
     state: "paused",
     progress: record.progress,
     message: "Workflow paused because its host process ended before completion",
+    reason: "interrupted:host-process-ended",
   });
   await store.save(paused);
   return paused;

@@ -32,6 +32,7 @@ export type ResolvedWorkflowRunOptions = Omit<
   | "usageLimitMaxDelayMs"
   | "usageLimitAttempt"
   | "resumeEditedWorkflow"
+  | "resumeRerunEffects"
   | "budget"
 > & {
   readonly perf: boolean;
@@ -45,6 +46,7 @@ export type ResolvedWorkflowRunOptions = Omit<
   readonly usageLimitMaxDelayMs: number;
   readonly usageLimitAttempt: number;
   readonly resumeEditedWorkflow: boolean;
+  readonly resumeRerunEffects: boolean;
   readonly budget: number | null;
 };
 
@@ -111,6 +113,7 @@ export function resolveWorkflowRunOptions(
       0,
     ),
     resumeEditedWorkflow: input.resumeEditedWorkflow === true && hasResumeRunId(input.resumeFromRunId),
+    resumeRerunEffects: input.resumeRerunEffects === true && hasResumeRunId(input.resumeFromRunId),
     budget: budget ?? null,
   };
 }

@@ -14,6 +14,7 @@ import {
 } from "../.pi/extensions/pi-workflow-engine/src/background-workflows.ts";
 import { WorkflowPauseError } from "../.pi/extensions/pi-workflow-engine/src/cancellation.ts";
 import { WorkflowProviderUsageLimitError } from "../.pi/extensions/pi-workflow-engine/src/provider-usage-limit.ts";
+import { WorkflowGatePauseError } from "../.pi/extensions/pi-workflow-engine/src/gate.ts";
 import { runResolvedWorkflow, runWorkflow } from "../.pi/extensions/pi-workflow-engine/src/engine.ts";
 import type { LoadedWorkflow } from "../.pi/extensions/pi-workflow-engine/src/types.ts";
 import { WorkflowRunController } from "../.pi/extensions/pi-workflow-engine/src/workflow-run-controller.ts";
@@ -96,6 +97,14 @@ function context(
       },
     },
   } as unknown as ExtensionCommandContext;
+}
+
+async function waitUntil(predicate: () => boolean | Promise<boolean>, label: string): Promise<void> {
+  for (let attempt = 0; attempt < 100; attempt++) {
+    if (await predicate()) return;
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+  throw new Error(`Timed out waiting for ${label}`);
 }
 
 function registeredWorkflow(): LoadedWorkflow {
@@ -419,6 +428,60 @@ test("provider-limit timers resume from the journal and manual stop cancels pend
     assert.ok(clock.cleared >= 1);
   } finally {
     controller.sessionShutdown(ctx);
+    await background.sessionShutdown(ctx);
+    await rm(cwd, { recursive: true, force: true });
+  }
+});
+
+test("owner gate answers append a digest-bound decision and automatically resume", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "pi-workflow-gate-answer-"));
+  const notifications: Notification[] = [];
+  const ctx = context(cwd, notifications, "rpc");
+  const mod: LoadedWorkflow = {
+    meta: { name: "registered-gate", description: "registered gate test" },
+    default: async (api) => {
+      const decision = await api.gate("testbenches", {
+        review: ["generated testbench contents"],
+        context: "Review generated testbenches before delivery.",
+      });
+      return { summary: `gate:${decision.choice}` };
+    },
+    source: {
+      kind: "file",
+      path: "/extension/workflows/registered-gate.ts",
+      root: "/extension",
+      fingerprint: "registered-gate-source",
+    },
+  };
+  const background = new BackgroundWorkflowCoordinator({ sendMessage() {} } as Pick<ExtensionAPI, "sendMessage">);
+  const controller = new WorkflowRunController(background, {
+    resolveWorkflow: async (name) => name === mod.meta.name ? mod : undefined,
+    execute: async (runContext, _name, resolved, options) => {
+      await runResolvedWorkflow(runContext, resolved, "", options);
+    },
+  });
+  const store = new ProjectWorkflowRunStore(cwd);
+  try {
+    await assert.rejects(
+      runWorkflow(ctx as ExtensionContext, mod, "", {
+        runId: "gate-answer-source",
+        background: backgroundOrigin(ctx, 1),
+      }),
+      WorkflowGatePauseError,
+    );
+    const paused = await store.load("gate-answer-source");
+    assert.equal(paused?.state, "paused");
+    assert.equal(paused?.state === "paused" ? paused.gate?.name : undefined, "testbenches");
+
+    await controller.answerCommand("gate-answer-source approve", ctx);
+    assert.match(notifications.at(-1)?.message ?? "", /decision .* recorded/i);
+    await waitUntil(async () => (await store.list()).some((record) =>
+      record.options.resumeFromRunId === "gate-answer-source" && record.state === "completed"
+    ), "gate answer resume completion");
+    const resumed = (await store.list()).find((record) => record.options.resumeFromRunId === "gate-answer-source");
+    assert.equal(resumed?.state, "completed");
+    assert.match(resumed?.state === "completed" ? JSON.stringify(resumed.result) : "", /gate:approve/);
+  } finally {
     await background.sessionShutdown(ctx);
     await rm(cwd, { recursive: true, force: true });
   }

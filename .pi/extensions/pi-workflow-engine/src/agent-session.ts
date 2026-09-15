@@ -25,6 +25,7 @@ import { providerErrorFromMessages } from "./agent-retry.ts";
 import { synchronizeWorkflowModelRuntime } from "./agent-session-providers.ts";
 import { matchesAgentToolHint, WorkflowToolHintUnavailableError } from "./tool-capabilities.ts";
 import type { AgentToolHint } from "./types.ts";
+import { createWriteAllowExtension } from "./write-allow.ts";
 
 export const FINAL_TOOL = "final_answer";
 
@@ -268,9 +269,20 @@ async function prepareAgentSessionResources(input: {
     log: (message: string) => rc.progress.log(`${label}: ${message}`),
   };
   const preparedSkills = prepareAgentSkillResources(skillOptions);
+  const writeAllowExtension = opts.writeAllow === undefined
+    ? undefined
+    : createWriteAllowExtension({
+        workspaceRoot: cwd,
+        patterns: opts.writeAllow,
+        label,
+        log: (message) => rc.progress.log(message),
+      });
   const services = await createAgentSessionServices({
     cwd,
-    resourceLoaderOptions: preparedSkills.resourceLoaderOptions,
+    resourceLoaderOptions: {
+      ...preparedSkills.resourceLoaderOptions,
+      extensionFactories: writeAllowExtension ? [writeAllowExtension] : undefined,
+    },
   });
   await synchronizeWorkflowModelRuntime({
     host: rc.modelRegistry,

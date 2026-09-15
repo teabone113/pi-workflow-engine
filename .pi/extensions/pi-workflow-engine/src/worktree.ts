@@ -409,7 +409,7 @@ export async function captureWorktreePatch(options: {
   const diff = await runner
     .runGit({
       cwd: options.worktreePath,
-      args: ["diff", "--binary", "--full-index", "--no-ext-diff", "--no-color", options.baselineOid, "--"],
+      args: ["diff", "--binary", "--full-index", "--no-ext-diff", "--no-color", "--src-prefix=a/", "--dst-prefix=b/", options.baselineOid, "--"],
       signal: options.signal,
       timeoutMs,
       maxBufferBytes: WORKTREE_DIFF_MAX_BYTES,

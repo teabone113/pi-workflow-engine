@@ -23,6 +23,7 @@ import {
   createWorkflowJournal,
   loadJournalEntries,
   workflowJournalPath,
+  WorkflowJournalSequenceError,
 } from "../.pi/extensions/pi-workflow-engine/src/journal.ts";
 import { workflowRunRecordPath } from "../.pi/extensions/pi-workflow-engine/src/workflow-run-store.ts";
 import { NoopPerfRecorder } from "../.pi/extensions/pi-workflow-engine/src/perf.ts";
@@ -325,7 +326,7 @@ test("workflows with explicitly unverifiable provenance never replay cached agen
   }
 });
 
-test("changing workflow implementation invalidates all calls from the old source", async () => {
+test("changing recorded call order fails strict resume at the first divergent sequence", async () => {
   const cwd = await mkdtemp(join(tmpdir(), "pi-workflow-resume-suffix-"));
   const original = workflowModule("linear", async (api) => [
         await api.agent("a", { resume: "read-only", resumeInputs: ["."] }),
@@ -346,17 +347,19 @@ test("changing workflow implementation invalidates all calls from the old source
   });
 
   const livePrompts: string[] = [];
-  const result = await runWithJournal({
-    cwd,
-    mod: changed,
-    resumeFrom: "first-run",
-    writeRunId: "second-run",
-    createSession: createLiveTextSession((prompt) => livePrompts.push(prompt)),
-  });
+  await assert.rejects(
+    runWithJournal({
+      cwd,
+      mod: changed,
+      resumeFrom: "first-run",
+      writeRunId: "second-run",
+      createSession: createLiveTextSession((prompt) => livePrompts.push(prompt)),
+    }),
+    WorkflowJournalSequenceError,
+  );
 
-  assert.deepEqual(result, ["live:a", "live:changed", "live:c"]);
-  assert.deepEqual(livePrompts, ["a", "changed", "c"]);
-  assert.equal((await loadJournalEntries(workflowJournalPath(cwd, "second-run"))).length, 3);
+  assert.deepEqual(livePrompts, ["a"]);
+  assert.equal((await loadJournalEntries(workflowJournalPath(cwd, "second-run"))).length, 1);
 });
 
 test("explicit edited-workflow resume reuses only behaviorally unchanged calls", async () => {
@@ -397,7 +400,7 @@ test("explicit edited-workflow resume reuses only behaviorally unchanged calls",
   }
 });
 
-test("edited-workflow resume keeps duplicate unkeyed calls ambiguous", async () => {
+test("recorded sequences disambiguate duplicate calls during edited-workflow resume", async () => {
   const cwd = await mkdtemp(join(tmpdir(), "pi-workflow-resume-edited-duplicates-"));
   const original = workflowModule("duplicates", async (api) => await api.parallel([
     () => api.agent("same", { resume: "read-only", resumeInputs: ["."] }),
@@ -421,7 +424,7 @@ test("edited-workflow resume keeps duplicate unkeyed calls ambiguous", async () 
       writeRunId: "second-run",
       createSession: createSequencedTextSession((prompt) => livePrompts.push(prompt)),
     });
-    assert.deepEqual(livePrompts, ["same", "same"]);
+    assert.deepEqual(livePrompts, []);
   } finally {
     await rm(cwd, { recursive: true, force: true });
   }
@@ -746,11 +749,15 @@ test("parallel resume replays stable keys despite completion-order journal write
     writeRunId: "first-run",
     createSession: createDelayedTextSession({ slow: 20, fast: 0 }, () => {}),
   });
+  const parallelJournal = await loadJournalEntries(workflowJournalPath(cwd, "first-run"));
   assert.deepEqual(
-    (await loadJournalEntries(workflowJournalPath(cwd, "first-run"))).map((entry) =>
-      entry.version === 2 ? entry.result : entry.value,
-    ),
+    parallelJournal.map((entry) => entry.version === 2 ? entry.result : entry.value),
     ["live:fast", "live:slow"],
+  );
+  assert.deepEqual(
+    parallelJournal.map((entry) => entry.version === 2 ? entry.sequence : undefined),
+    [2, 1],
+    "recorded sequence is reserved before asynchronous completion",
   );
 
   const livePrompts: string[] = [];
@@ -767,7 +774,7 @@ test("parallel resume replays stable keys despite completion-order journal write
   assert.deepEqual(livePrompts, []);
 });
 
-test("pipeline resume replays later stages by stable item keys", async () => {
+test("edited-workflow pipeline resume tolerates asynchronous stage invocation reordering", async () => {
   const cwd = await mkdtemp(join(tmpdir(), "pi-workflow-resume-pipeline-"));
   const mod = workflowModule("pipeline", async (api) =>
     await api.pipeline(
@@ -789,6 +796,7 @@ test("pipeline resume replays later stages by stable item keys", async () => {
     cwd,
     mod,
     resumeFrom: "first-run",
+    resumeEditedWorkflow: true,
     writeRunId: "second-run",
     createSession: createDelayedTextSession({}, (prompt) => livePrompts.push(prompt)),
   });

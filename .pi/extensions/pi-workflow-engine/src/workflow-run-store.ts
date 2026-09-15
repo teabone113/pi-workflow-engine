@@ -7,6 +7,7 @@ import {
   isWorkflowRunRecord,
   transitionWorkflowRun,
   updateWorkflowRunProgress,
+  updateWorkflowRunRecordedPosition,
   type WorkflowRunRecord,
   type WorkflowRunTransition,
 } from "./workflow-run-record.ts";
@@ -117,6 +118,11 @@ export class DurableWorkflowRun {
 
   transition(transition: WorkflowRunTransition): void {
     this.record = transitionWorkflowRun(this.record, transition);
+    this.queue(this.record);
+  }
+
+  updateRecordedPosition(sequence: number, currentPhase: string, at = Date.now()): void {
+    this.record = updateWorkflowRunRecordedPosition(this.record, sequence, currentPhase, at);
     this.queue(this.record);
   }
 

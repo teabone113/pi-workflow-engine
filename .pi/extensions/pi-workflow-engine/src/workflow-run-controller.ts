@@ -6,7 +6,13 @@ import type {
 import type { AutocompleteItem } from "@earendil-works/pi-tui";
 import { BackgroundWorkflowCoordinator } from "./background-workflows.ts";
 import { backgroundUnavailableResult, startBackgroundWorkflowTool } from "./background-workflow-tool.ts";
-import { validateWorkflowRunId } from "./journal.ts";
+import {
+  createMemoryBackedJournal,
+  loadJournalEntries,
+  validateWorkflowRunId,
+  workflowJournalPath,
+  type JournalEntryV2,
+} from "./journal.ts";
 import { resolveWorkflowRunOptions, type ResolvedWorkflowRunOptions } from "./options.ts";
 import type { LoadedWorkflow } from "./types.ts";
 import {
@@ -26,6 +32,7 @@ import { transitionWorkflowRun, type WorkflowRunRecord } from "./workflow-run-re
 import { ProjectWorkflowRunStore, type WorkflowRunStore } from "./workflow-run-store.ts";
 import { unknownErrorMessage } from "./unknown-error.ts";
 import { emptyWorkflowUsageTotals } from "./usage.ts";
+import { commandGateDecision } from "./gate.ts";
 import {
   WorkflowUsageLimitScheduler,
   type WorkflowUsageLimitSchedulerClock,
@@ -106,6 +113,63 @@ export class WorkflowRunController {
       return;
     }
     await this.openRunSelector(ctx);
+  }
+
+  async resumeCommand(args: string, ctx: ExtensionCommandContext): Promise<void> {
+    const parts = args.trim().split(/\s+/).filter(Boolean);
+    const runId = parts.shift();
+    const allowedFlags = new Set(["--resume-edited", "--resume-rerun-effects"]);
+    if (!runId || parts.some((part) => !allowedFlags.has(part))) {
+      ctx.ui.notify("Usage: /workflow:resume <run-id> [--resume-edited] [--resume-rerun-effects]", "warning");
+      return;
+    }
+    const record = await this.loadRecord(ctx.cwd, runId);
+    if (!record) {
+      ctx.ui.notify(`Workflow run ${runId} was not found.`, "warning");
+      return;
+    }
+    if (record.state !== "paused" || !canRelaunchWorkflowRun(record)) {
+      ctx.ui.notify(`Workflow run ${runId} is not a resumable paused registered workflow.`, "warning");
+      return;
+    }
+    try {
+      const message = await this.relaunch(ctx, record, "resume", {
+        resumeEditedWorkflow: parts.includes("--resume-edited") ? true : undefined,
+        resumeRerunEffects: parts.includes("--resume-rerun-effects") ? true : undefined,
+      });
+      ctx.ui.notify(message, "info");
+    } catch (error) {
+      ctx.ui.notify(`Workflow resume failed: ${unknownErrorMessage(error)}`, "error");
+    }
+  }
+
+  async answerCommand(args: string, ctx: ExtensionCommandContext): Promise<void> {
+    const match = /^(\S+)\s+(\S+)(?:\s+([\s\S]*))?$/.exec(args.trim());
+    if (!match) {
+      ctx.ui.notify("Usage: /workflow:answer <run-id> <choice> [text]", "warning");
+      return;
+    }
+    const [, runId, choice, text] = match;
+    const record = await this.loadRecord(ctx.cwd, runId!);
+    if (record?.state !== "paused" || !record.gate) {
+      ctx.ui.notify(`Workflow run ${runId} is not paused at an owner gate.`, "warning");
+      return;
+    }
+    let recorded = false;
+    try {
+      const decision = commandGateDecision(record.gate, choice!, text);
+      await this.recordGateAnswer(ctx.cwd, record, decision);
+      recorded = true;
+      const message = await this.relaunch(ctx, record, "resume");
+      ctx.ui.notify(`Gate "${record.gate.name}" decision "${decision.choice}" recorded for review digest ${decision.reviewedDigest}. ${message}`, "info");
+    } catch (error) {
+      ctx.ui.notify(
+        recorded
+          ? `Gate decision was recorded, but workflow resume failed: ${unknownErrorMessage(error)}`
+          : `Workflow answer failed: ${unknownErrorMessage(error)}`,
+        "error",
+      );
+    }
   }
 
   async inspectStoredRun(ctx: ExtensionContext, runId: string): Promise<boolean> {
@@ -225,6 +289,7 @@ export class WorkflowRunController {
     ctx: ExtensionContext,
     record: WorkflowRunRecord,
     action: "resume" | "restart",
+    overrides: { readonly resumeEditedWorkflow?: boolean; readonly resumeRerunEffects?: boolean } = {},
   ): Promise<string> {
     const unavailable = backgroundUnavailableResult(ctx.mode);
     if (unavailable) {
@@ -239,6 +304,7 @@ export class WorkflowRunController {
     if (
       action === "resume"
       && workflow.source.fingerprint !== record.workflow.sourceFingerprint
+      && !(overrides.resumeEditedWorkflow ?? record.options.resumeEditedWorkflow)
     ) {
       throw new Error("workflow source changed, so journal replay cannot resume safely");
     }
@@ -259,6 +325,12 @@ export class WorkflowRunController {
       budget: record.options.budget ?? undefined,
       resultViewer: "skip",
       resumeFromRunId: action === "resume" ? record.runId : undefined,
+      resumeEditedWorkflow: action === "resume"
+        ? overrides.resumeEditedWorkflow ?? record.options.resumeEditedWorkflow
+        : false,
+      resumeRerunEffects: action === "resume"
+        ? overrides.resumeRerunEffects ?? record.options.resumeRerunEffects
+        : false,
     });
     const result = await startBackgroundWorkflowTool({
       coordinator: this.background,
@@ -272,6 +344,38 @@ export class WorkflowRunController {
     const message = first?.type === "text" ? first.text : `Workflow ${action} started.`;
     if (typeof result.details.error === "string") throw new Error(message);
     return message;
+  }
+
+  private async recordGateAnswer(
+    cwd: string,
+    record: Extract<WorkflowRunRecord, { readonly state: "paused" }>,
+    decision: ReturnType<typeof commandGateDecision>,
+  ): Promise<void> {
+    const gate = record.gate;
+    if (!gate) throw new Error(`Workflow run ${record.runId} has no pending gate.`);
+    const path = workflowJournalPath(cwd, record.runId);
+    const entries = await loadJournalEntries(path, { required: true });
+    const existing = entries.filter((entry): entry is JournalEntryV2 =>
+      entry.version === 2 &&
+      (entry.kind ?? "agent") === "gate" &&
+      entry.sequence === gate.sequence &&
+      entry.key === gate.key
+    );
+    if (existing.length > 0) {
+      const same = existing.some((entry) => {
+        if (typeof entry.result !== "object" || entry.result === null) return false;
+        const prior = entry.result as Record<string, unknown>;
+        return prior.choice === decision.choice && prior.text === decision.text && prior.reviewedDigest === decision.reviewedDigest;
+      });
+      if (same) return;
+      throw new Error(`Gate ${gate.name} already has a different recorded decision.`);
+    }
+    const journal = createMemoryBackedJournal([], path, false);
+    const recorded = await journal.record(gate.key, decision, gate.identity, {
+      kind: "gate",
+      sequence: gate.sequence,
+    });
+    if (!recorded.ok) throw new Error(`Could not record gate decision: ${recorded.error}`);
   }
 
   private async autoResume(ctx: ExtensionContext, runId: string, attempt: number): Promise<void> {
@@ -350,5 +454,13 @@ export function registerWorkflowRunCommand(
     description: "List, inspect, stop, resume, or restart durable workflow runs",
     getArgumentCompletions: (argumentPrefix) => controller.argumentCompletions(argumentPrefix),
     handler: (args, ctx) => controller.handleCommand(args, ctx),
+  });
+  pi.registerCommand("workflow:resume", {
+    description: "Resume a paused durable workflow run from its journal",
+    handler: (args, ctx) => controller.resumeCommand(args, ctx),
+  });
+  pi.registerCommand("workflow:answer", {
+    description: "Answer an owner gate and resume its durable workflow run",
+    handler: (args, ctx) => controller.answerCommand(args, ctx),
   });
 }

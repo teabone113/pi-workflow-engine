@@ -7,7 +7,6 @@ import type { ExtensionCommandContext, ExtensionContext } from "@earendil-works/
 import type { Component, TUI } from "@earendil-works/pi-tui";
 import {
   buildTemporaryWorkflowAuthorPrompt,
-  getLastWorkflowInspection,
   inlineCompileErrorResult,
   normalizeWorkflowToolRequest,
   openWorkflowInspector,
@@ -157,6 +156,12 @@ function createFakeApi(overrides: Partial<WorkflowApi> = {}): WorkflowApi {
   const agent = (async (_prompt: string, opts?: AgentOptions) => (opts?.schema ? { ok: true } : "agent text")) as WorkflowApi["agent"];
   return {
     agent,
+    run: async () => { throw new Error("run steps are not enabled in this context"); },
+    now: async () => 0,
+    random: async () => 0,
+    uuid: async () => "00000000-0000-4000-8000-000000000000",
+    artifact: async () => { throw new Error("artifacts are not enabled in this context"); },
+    gate: async () => { throw new Error("gates are not enabled in this context"); },
     workflow: async () => {
       throw new Error("sub-workflows are not enabled in this context");
     },
@@ -195,6 +200,8 @@ test("RPC command and inspector surfaces use native selection and text instead o
   const extension = captureWorkflowExtension();
   const command = extension.commands.get("workflow");
   assert.ok(command);
+  assert.ok(extension.commands.has("workflow:resume"));
+  assert.ok(extension.commands.has("workflow:answer"));
   const notifications: string[] = [];
   let selectCalls = 0;
   let customCalls = 0;
@@ -392,6 +399,47 @@ test("workflow tool requires a prior run for edited-source reuse", async () => {
   assert.deepEqual(result.details, { error: "invalid_edited_workflow_resume" });
 });
 
+test("workflow tool requires a prior run before authorizing manual-effect reruns", async () => {
+  const tool = captureWorkflowTool();
+  const result = await tool.execute(
+    "call-effect-resume",
+    { script: "export const meta = { name: 'effect', description: 'effect' }; export default async function () { return 'no'; }", resumeRerunEffects: true },
+    undefined,
+    () => {},
+    HEADLESS_CTX,
+  );
+
+  assert.ok(isRecord(result));
+  const content = result.content;
+  assert.ok(Array.isArray(content));
+  assert.equal(content[0]?.text, "resumeRerunEffects requires resumeFromRunId.");
+  assert.deepEqual(result.details, { error: "invalid_effect_resume" });
+});
+
+test("workflow tool reports a headless owner gate as a durable paused run", async () => {
+  const tool = captureWorkflowTool();
+  const script = `
+export const meta = { name: "headless-gate", description: "Headless gate" };
+export default async function run({ gate }) {
+  return gate("ship", { review: ["release candidate"] });
+}
+`;
+  const result = await tool.execute("call-headless-gate", { script }, undefined, () => {}, HEADLESS_CTX);
+  assert.ok(isRecord(result) && isRecord(result.details));
+  assert.equal(result.details.paused, true);
+  assert.equal(result.details.state, "paused");
+  assert.equal(result.details.reason, "gate:ship");
+  assert.match(String(result.details.answerCommand), /^\/workflow:answer /);
+  const content = result.content;
+  assert.ok(Array.isArray(content));
+  assert.match(content[0]?.text ?? "", /Waiting for one of: approve, reject/);
+  const runId = result.details.runId;
+  assert.equal(typeof runId, "string");
+  if (typeof runId === "string") {
+    assert.equal((await new ProjectWorkflowRunStore(WORKFLOW_TOOL_TEST_CWD).load(runId))?.state, "paused");
+  }
+});
+
 test("workflow tool rejects background mode in finite print execution", async () => {
   const tool = captureWorkflowTool();
   const ctx = { ...HEADLESS_CTX, mode: "print" } as ExtensionContext;
@@ -455,7 +503,8 @@ export default async function run() {
 });
 
 test("a tool-invoked workflow records an inspector snapshot", async () => {
-  const tool = captureWorkflowTool();
+  const extension = captureWorkflowExtension();
+  const tool = extension.tool;
   const script = `
 export const meta = { name: "inspect-probe", description: "Inspector capture probe" };
 export default async function run({ phase }) {
@@ -467,17 +516,20 @@ export default async function run({ phase }) {
   const result = await tool.execute("call-1", { script }, undefined, () => {}, HEADLESS_CTX);
 
   assert.equal(resultUsageAssistantMessages(result), 0);
-  const inspection = getLastWorkflowInspection();
-  assert.equal(inspection?.name, "inspect-probe");
-  assert.ok(
-    inspection?.snapshot.phases.some((phase) => phase.title === "Solo"),
-    `expected a "Solo" phase in the captured snapshot, got ${JSON.stringify(inspection?.snapshot.phases.map((p) => p.title))}`,
-  );
+  assert.ok(isRecord(result) && isRecord(result.details));
+  assert.equal(result.details.name, "inspect-probe");
+  const runId = result.details.runId;
+  assert.equal(typeof runId, "string");
+  const record = typeof runId === "string"
+    ? await new ProjectWorkflowRunStore(WORKFLOW_TOOL_TEST_CWD).load(runId)
+    : undefined;
+  assert.ok(record?.progress.phases.some((phase) => phase.title === "Solo"));
 });
 
 test("a TUI tool-invoked workflow opens the live inspector", async () => {
-  const tool = captureWorkflowTool();
-  const { ctx, customCalls, customOptions } = createTuiContext();
+  const extension = captureWorkflowExtension();
+  const tool = extension.tool;
+  const { ctx, customCalls, customOptions, customRenders } = createTuiContext();
   const script = `
 export const meta = { name: "inspect-live-probe", description: "Live inspector probe" };
 export default async function run({ phase }) {
@@ -490,8 +542,7 @@ export default async function run({ phase }) {
 
   assert.equal(customCalls(), 1);
   assert.deepEqual(customOptions()[0], WORKFLOW_VIEWER_OVERLAY_OPTIONS);
-  const inspection = getLastWorkflowInspection();
-  assert.equal(inspection?.name, "inspect-live-probe");
+  assert.match(customRenders().flat().join("\n"), /Workflow Inspector inspect-live-probe/);
 });
 
 test("the results command and shortcut reopen the last code-review findings without rerunning it", async () => {

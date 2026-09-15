@@ -25,6 +25,7 @@ import {
 } from "./agent-workspace.ts";
 import type { AgentResumeBaseContext, AgentResumeContext, RepositoryResumeContext } from "./resume-context.ts";
 import { captureRepositoryMutationGuard } from "./resume-context.ts";
+import type { RecordedCallReservation } from "./recorded.ts";
 
 /** Execute one fully bracketed workspace/session attempt. Cleanup always precedes settlement. */
 export async function executeAgentAttempt(input: {
@@ -38,8 +39,9 @@ export async function executeAgentAttempt(input: {
   readonly rowId: number;
   readonly tags: AgentRunTags;
   readonly admitLiveAgent: () => void;
+  readonly recordedCall?: RecordedCallReservation;
 }): Promise<AgentAttemptResult> {
-  const { rc, prompt, opts, resumeBaseContext, model, replay, label, rowId, tags, admitLiveAgent } = input;
+  const { rc, prompt, opts, resumeBaseContext, model, replay, label, rowId, tags, admitLiveAgent, recordedCall } = input;
   let repositoryBefore: RepositoryResumeContext | undefined;
   let evidence: AgentReplayEvidence | undefined;
   if (isReplayEnabled(replay)) {
@@ -80,7 +82,8 @@ export async function executeAgentAttempt(input: {
         rc.progress.log(`${label}: resume disabled for this call (${capture.reason})`);
       } else {
         identity = capture.identity;
-        const cached = await lookupReplayResult({ rc, key: replay.key, identity, opts, workspace });
+        if (!recordedCall) throw new Error("Replayable agent call did not reserve a recorded sequence.");
+        const cached = await lookupReplayResult({ rc, recordedCall, identity, opts, workspace });
         if (cached.hit) {
           const contract = await validateReplayIdentity({
             rc,

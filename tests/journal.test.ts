@@ -117,6 +117,7 @@ test("hashAgentCall changes when behavioral inputs change", () => {
   assert.notEqual(hashAgentCall("inspect", { thinkingLevel: "low", tools: ["read", "grep"] }), base);
   assert.notEqual(hashAgentCall("inspect", { thinkingLevel: "low", tools: ["read"], schema: Type.Object({ ok: Type.Boolean() }) }), base);
   assert.notEqual(hashAgentCall("inspect", { thinkingLevel: "low", tools: ["read"], requireToolHints: true }), base);
+  assert.notEqual(hashAgentCall("inspect", { thinkingLevel: "low", tools: ["read"], writeAllow: ["src/**"] }), base);
 });
 
 test("agentJournalKey uses optional cache keys without hiding behavior changes", () => {
@@ -147,6 +148,16 @@ test("agentJournalKey includes the isolated worktree baseline identity", () => {
       { ref: "a".repeat(40), patch: "second patch" },
     ),
     first,
+  );
+});
+
+test("legacy v2 agent entries without kind or sequence remain replayable by key", () => {
+  const journal = createMemoryBackedJournal([
+    { version: 2, key: "legacy-agent", result: "cached", identity: RESUME_CONTEXT },
+  ]);
+  assert.deepEqual(
+    journal.lookup("legacy-agent", RESUME_CONTEXT, { kind: "agent", sequence: 7 }),
+    { hit: true, value: "cached" },
   );
 });
 
@@ -307,8 +318,8 @@ test("journal records append JSONL and explicit resume load failures are visible
   assert.deepEqual(await journal.record("key-2", null, RESUME_CONTEXT), { ok: true });
 
   assert.deepEqual(await loadJournalEntries(path), [
-    { version: 2, key: "key-1", result: { ok: true }, identity: RESUME_CONTEXT },
-    { version: 2, key: "key-2", result: null, identity: RESUME_CONTEXT },
+    { version: 2, kind: "agent", key: "key-1", result: { ok: true }, identity: RESUME_CONTEXT },
+    { version: 2, kind: "agent", key: "key-2", result: null, identity: RESUME_CONTEXT },
   ]);
   assert.deepEqual(await loadJournalEntries(join(dir, "missing.jsonl")), []);
   await assert.rejects(() => createWorkflowJournal({ resumePath: join(dir, "missing.jsonl"), writePath: join(dir, "next.jsonl") }), WorkflowJournalLoadError);

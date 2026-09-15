@@ -38,11 +38,14 @@ Useful flags:
 /workflow code-review --agent-timeout-ms=600000 # abort one live agent after 10 minutes
 /workflow code-review --agent-retries=2  # retry classified transient provider failures
 /workflow code-review --budget=50000     # output-token ceiling for subagents
-/workflow code-review --resume <run-id>  # replay matching completed agent calls
-/workflow code-review --resume <run-id> --resume-edited # reuse unchanged calls after a workflow edit
+/workflow code-review --resume <run-id>  # replay matching recorded calls
+/workflow code-review --resume <run-id> --resume-edited # allow key fallback after source/order edits
+/workflow code-review --resume <run-id> --resume-rerun-effects # explicitly permit missing manual effects
 /workflow code-review --refresh          # rediscover newly added workflow files
 /workflow:runs                           # browse recent durable project runs
 /workflow:inspector <run-id>             # inspect one retained run directly
+/workflow:resume <run-id>                # resume a paused registered workflow
+/workflow:answer <run-id> <choice> [text] # answer a paused owner gate and resume
 /workflow:models                         # inspect small/medium/big model routes
 ```
 
@@ -247,7 +250,7 @@ During a run, pi shows live phases and subagent status. Use `--inspect` if you w
 
 ### Durable run records
 
-Every workflow run writes a versioned project-local record to `.pi/.workflow-runs/<run-id>.run.json`; its agent replay journal remains `.pi/.workflow-runs/<run-id>.jsonl`. The same run ID appears in execution metadata, progress snapshots, result details, and both filenames. Records distinguish `queued`, `running`, `completed`, `failed`, `stopped`, and `paused` lifecycle states and retain resolved scalar options, timestamps, compact progress, summary usage, and the final result or error.
+Every workflow run writes a versioned project-local record to `.pi/.workflow-runs/<run-id>.run.json`; its generalized recorded-call journal is `.pi/.workflow-runs/<run-id>.jsonl`. The same run ID appears in execution metadata, progress snapshots, result details, and both filenames. Records distinguish `queued`, `running`, `completed`, `failed`, `stopped`, and `paused` lifecycle states and retain resolved scalar options, timestamps, compact progress, the current phase, highest reserved journal sequence, a sanitized pause reason/payload, summary usage, and the final result or error.
 
 Record replacement is atomic, corrupt or unsupported-version files are ignored independently, and the newest 50 run records are retained. Journal retention remains 50 files. Both record and journal files are excluded from repository resume fingerprints, so checkpoint writes do not invalidate replay.
 
@@ -279,6 +282,29 @@ The equivalent environment defaults are `PI_WORKFLOW_USAGE_LIMIT_AUTO_RESUME=1`,
 
 A graceful pi session shutdown aborts active background work and records it as `paused` instead of successful. Reopening the same session after an ungraceful process exit also reconciles a retained `queued` or `running` background record to `paused`. Resuming the originating pi session delivers that interruption once. If the originating session no longer exists, the record remains in `.pi/.workflow-runs/`, delivery is marked unavailable, and a fallback is written to stderr. Background mode is supported in long-lived TUI and RPC sessions; `print` and `json` modes reject it because those processes exit after the prompt. This feature is in-process rather than a daemon: a hard process kill cannot keep model work running, but the last atomic run checkpoint remains available.
 
+### Owner gates
+
+`api.gate(name, options)` stops delivery until the owner explicitly reviews the supplied text and/or artifact metadata. The decision is cryptographically bound to a canonical SHA-256 digest of the ordered review material. It is reused only when the gate identity, choice set, and reviewed digest still match; changing generated content never inherits an old approval.
+
+```ts
+const plan = await artifact("plan.json", generatedPlan);
+const decision = await gate("deployment-plan", {
+  review: [plan, "Deploy the generated plan to staging."],
+  context: "Check targets, deletions, and rollback steps before choosing.",
+  choices: ["approve", "reject", "revise"],
+  text: { prompt: "Add a short decision note" },
+});
+```
+
+In TUI/RPC UI mode the context, bounded review preview, digest, and choices are shown before selection; there is no default approval. Escape/cancel, timeout, headless execution, or host shutdown creates a durable `paused` record with reason `gate:<name>`, the current phase/recorded sequence, choices, digest, and an exact answer command. Answer from a long-lived session with:
+
+```text
+/workflow:answer <run-id> approve "reviewed targets and rollback"
+/workflow:resume <run-id>
+```
+
+`/workflow:answer` validates the choice/text against the persisted gate, appends the external decision to the source run journal at the gate's original sequence, then automatically starts a new background run with `resumeFromRunId`. The resumed `gate()` re-computes the current review digest before accepting that decision. Only registered file workflows without redacted arguments can be relaunched; inline and argument-bearing paused runs remain inspectable but their executable input is intentionally not persisted.
+
 ### Recent runs and lifecycle actions
 
 `/workflow:runs` opens pi's native selection UI with a bounded list of recent project runs. Each option includes an accessible state label, workflow name, age, duration, usage summary, and full run ID. Choose a run, then choose one of the lifecycle actions currently valid for it: inspect, stop, resume, or restart. The background activity line is present only while this session owns active background work.
@@ -290,10 +316,12 @@ The same operations are available without the selection UI:
 /workflow:runs stop <run-id>
 /workflow:runs resume <run-id>
 /workflow:runs restart <run-id>
+/workflow:resume <run-id> [--resume-edited] [--resume-rerun-effects]
+/workflow:answer <run-id> <choice> [text]
 /workflow:inspector <run-id>
 ```
 
-Inspect is always safe. Stop is available for a background run active in the current session and for a retained paused run with a pending resume timer. Resume is limited to paused registered workflows whose source fingerprint is unchanged and whose invocation had no redacted arguments; it starts a new background run ID with `resumeFromRunId` journal replay. Restart is limited to completed, failed, or stopped registered workflows that had no arguments and also creates a new background run ID. Inline workflows and argument-bearing invocations are intentionally not relaunched because their executable input was not persisted. In `print` and `json` modes, list and inspect return formatted text without opening TUI components, while resume/restart report that background execution requires TUI or RPC mode.
+Inspect is always safe. Stop is available for a background run active in the current session and for a retained paused run with a pending resume timer. Resume is limited to paused registered workflows whose source fingerprint is unchanged (unless `--resume-edited` is explicit) and whose invocation had no redacted arguments; it starts a new background run ID with `resumeFromRunId` journal replay. `--resume-rerun-effects` is a separate high-risk acknowledgement for missing manual-effect commands. Restart is limited to completed, failed, or stopped registered workflows that had no arguments and also creates a new background run ID. Inline workflows and argument-bearing invocations are intentionally not relaunched because their executable input was not persisted. In `print` and `json` modes, list and inspect return formatted text without opening TUI components, while resume/restart report that background execution requires TUI or RPC mode.
 
 Code-review findings are rendered as a formatted result message by default. pi no longer asks whether to open the findings viewer. Use `--result-viewer` or `--review-viewer` when you want to inspect findings interactively, press `enter` to expand/collapse the nicely formatted finding text, and use `1`-`9` to jump directly to a visible finding. The viewer is centred, scales to the terminal, and shows the visible finding/detail ranges while scrolling. `/workflow:results` or `ctrl+shift+r` reopens the most recent validated code-review report in the current pi session without rerunning the workflow; selections reset when it reopens.
 
@@ -310,11 +338,13 @@ Every workflow result includes a run id. Resume with:
 /workflow code-review --resume <run-id> --resume-edited HEAD~3
 ```
 
-The `workflow` tool exposes the same features as `resumeFromRunId` and the opt-in `resumeEditedWorkflow: true`. By default, any workflow source change invalidates every prior call. Edited-workflow resume waives only that source-fingerprint mismatch: repository state, runtime, model, system prompt, thinking level, prompt, schema, ordered skills, tools, isolation, and all other replay checks must still match.
+The `workflow` tool exposes the same controls as `resumeFromRunId`, `resumeEditedWorkflow`, and `resumeRerunEffects`. The journal covers `agent()`, `run()`, `now()`, `random()`, `uuid()`, `artifact()`, and `gate()`. Every call reserves one root-run sequence synchronously before asynchronous work begins, so parallel completion order does not change its recorded position.
 
-With edited-workflow resume enabled, unchanged calls are reused while changed or newly added calls run live. Matching uses a stable behavioral hash, not call or completion order. Repeated identical calls are deliberately ambiguous and run live unless each logical call has a stable, distinct `cacheKey`. The new run record retains the opt-in policy and reports cached and live agent totals. The engine only inspects the prior run's JSON journal; it never loads or executes the prior workflow source.
+Strict resume looks up **sequence + kind + key**. If the previous journal contains a different kind/key at that sequence, the run fails with both expected and found calls instead of silently reusing or rerunning work. A missing tail call runs live. Legacy v2 agent entries without `kind` or `sequence` remain readable by key; missing `kind` means `agent`. Each resumed run writes a fresh sequenced journal under its new run ID. The engine reads data only—it never loads or executes prior workflow source.
 
-This option can return a result produced before an orchestration edit when that call's explicit identity did not change. Use it only when the unchanged call is still semantically valid in the edited workflow, and prefer stable `cacheKey` values for repeated logical calls. Omit `--resume-edited` or `resumeEditedWorkflow` for the fail-closed default.
+`--resume-edited` (tool field `resumeEditedWorkflow: true`) is an explicit escape hatch for intentional source or orchestration edits. It permits key-only fallback when sequence order diverged and waives only the workflow-source fingerprint mismatch. The complete per-kind identity must still match. Unchanged duplicate calls are now disambiguated when their recorded sequence still matches; when fallback is required, use stable distinct `cacheKey` values for repeated logical agents. Use this option only when replayed results remain semantically valid after the edit.
+
+A missing `run(..., { effect: "manual" })` never executes during resume by default because an interrupted external effect may already have happened without a journal entry. After independently verifying that it is safe, pass `--resume-rerun-effects` or tool field `resumeRerunEffects: true`. This is separate from `--resume-edited`. A completed matching manual-effect journal entry replays normally without either override.
 
 Replay is explicit for agents that share the workflow directory and automatic for isolated patch-producing agents:
 
@@ -325,15 +355,15 @@ Replay is explicit for agents that share the workflow directory and automatic fo
 
 Use `resume: "read-only"` only when the shared agent is advisory. In Git repositories the engine resolves the repository root and binds replay to HEAD, staged and unstaged tracked changes, index modes, and bounded non-ignored untracked contents across that whole worktree, even when pi starts in a subdirectory. Add ignored or generated files under the workflow cwd with cwd-relative `resumeInputs`; explicitly named ignored paths are fingerprinted directly and cannot escape that cwd. The complete identity is checked before accepting a hit, after execution, and again after cleanup. A changed surface turns a hit into a live run and prevents unsafe recording. Tracked symlinks, submodules, and unsupported index states fail closed. Use `resume: "off"` when the call may inspect undeclared ignored files, external paths, services, environment, or clock state.
 
-Journals use replay contract v2. A hit requires the same prompt/options and execution identity: repository-wide Git-visible state plus explicitly declared ignored inputs, workflow source provenance, coding-agent runtime version, effective system prompt/provider/model/thinking level, ordered selected skill contents, and ordered executable tool definitions plus source fingerprints. Unverifiable, cyclic, oversized, symlinked, submodule-backed, or mutable identity surfaces fail closed and run live. A tool-free structured agent uses a capability identity instead of hashing a workspace it cannot observe; an isolated agent binds replay to both the commit and tree objects of its exact prepared worktree baseline, including deterministic normalized snapshots for repositories with no commits. Each resumed run writes a fresh journal under its new run id, and cached results do not add usage or budget spend.
+For `agent()`, a hit still requires the same prompt/options and execution identity: repository-wide Git-visible state plus explicitly declared ignored inputs, workflow source provenance, coding-agent runtime version, effective system prompt/provider/model/thinking level, ordered selected skill contents, ordered executable tool definitions/source fingerprints, isolation, and `writeAllow`. Unverifiable, cyclic, oversized, symlinked, submodule-backed, or mutable identity surfaces fail closed and run live. A tool-free structured agent uses a capability identity instead of hashing a workspace it cannot observe; an isolated agent binds replay to both the commit and tree objects of its exact prepared worktree baseline. Cached agents add no usage or budget spend.
 
-Cached values are revalidated before use: text must still be text, structured output must satisfy the current typebox schema, and an isolated patch must have consistent metadata and pass `git apply --check --binary` against its fresh baseline worktree. A malformed or stale value runs live.
+Cached values are revalidated before use: text must still be text, structured output must satisfy the current typebox schema, an isolated patch must pass `git apply --check --binary`, a gate decision must match its choices/review digest, and an artifact's workspace-relative path, byte count, and SHA-256 digest must still match the stored file. A malformed agent/run/gate value runs live; an artifact integrity failure stops resume rather than hiding tampering. Replayed artifacts are materialized under the current run's artifact directory.
 
 Invalidations appear in progress output with a concise reason. Legacy v1 journals and early v2 entries without effective-session identity are parsed for compatibility but always miss. Git repositories with no commits and non-Git directories remain supported. Git control data and engine-owned workflow journals cannot be declared as inputs; if a Git-visible or explicit surface exceeds safety bounds, that call runs live.
 
 Statically loaded built-ins fingerprint and revalidate their bounded extension source tree so imported helper changes invalidate replay, while inline workflows use the compiler-provided script fingerprint. Dynamically discovered and programmatic modules are intentionally non-replayable because their transitive runtime imports or captured closures cannot be bound to an immutable source snapshot.
 
-Resume only caches completed `agent()` calls. It does not snapshot arbitrary workflow local variables, in-flight tool work, environment or clock state, external services, or generated inputs outside the captured repository/workflow/skill/tool surfaces. Use `resume: "off"` for calls that depend on those values, and keep prompts and options deterministic when you want cache hits.
+The journal records only completed primitive calls, not arbitrary workflow local variables or in-flight work. `run()` binds command/cwd/environment-key names/caller key in its key and the environment-value digest plus behavior in its identity; it does not infer external service state. Keep call order and inputs deterministic, use `resume: "off"` for agents whose observable inputs are not captured, and label shell effects honestly.
 
 ## Author a saved workflow
 
@@ -389,13 +419,35 @@ Core primitives:
 
 | Primitive | What it does |
 | --- | --- |
-| `agent(prompt, opts)` | Runs one isolated subagent. With `schema`, returns validated structured data. |
+| `agent(prompt, opts)` | Runs one subagent. With `schema`, returns validated structured data; `writeAllow` can constrain mutations. |
+| `run(command, opts)` | Runs a shell command with explicit `effect`, bounded stdout/stderr, timeout, cwd, env, and expected-exit behavior. |
+| `now()` / `random()` / `uuid()` | Returns journaled nondeterministic values that remain stable on resume. |
+| `artifact(name, content, opts?)` | Stores UTF-8 text or safe JSON under the current durable run directory and returns path/hash/size metadata. |
+| `gate(name, opts)` | Requires a digest-bound explicit owner choice or durably pauses the run. |
 | `parallel(thunks)` | Runs thunks concurrently and waits for all; recoverable failures become `null` slots. |
 | `parallel(thunks, { settled: true })` | Retains each success or recoverable failure as a serialisable discriminated result. |
 | `pipeline(items, ...stages)` | Runs each item through stages independently; a failed item becomes `null`. |
 | `phase(title)` / `log(message)` | Updates workflow progress UI. |
 | `progress(event)` | Emits counters, summaries, and lane items. |
 | `workflow(ref, args?)` | Runs another workflow inline as a sub-step and returns its result. |
+
+`run()` requires an effect classification on every call:
+
+```ts
+const check = await run("bun test", {
+  effect: "idempotent",
+  cwd: ".",
+  env: { CI: "1" },
+  timeoutMs: 120_000,
+  expectExitCode: 0,
+  key: "unit-tests",
+});
+const report = await artifact("test-result.json", check);
+```
+
+Each stdout and stderr stream retains at most 50 KiB. Timeout/abort terminates the process group, and the result reports `ok`, `exitCode`, `stdout`, `stderr`, `durationMs`, and `timedOut`. `cwd` must stay within the workflow workspace. `env` values are executed but journals bind only sorted key names plus a SHA-256 digest—never plaintext environment values. `effect: "idempotent"` may run when no replay entry exists; `effect: "manual"` gets the additional resume protection described above.
+
+Artifacts accept plain UTF-8 strings or bounded JSON-safe data, reject traversal/accessors/cycles/unsupported values, and are written atomically beneath `.pi/.workflow-runs/<run-id>/artifacts/`. Treat artifact metadata returned by `artifact()` as the stable item to pass into `gate().review`.
 
 Schema agents accept structured output only through the validated, terminating `final_answer` tool. If the first response omits it, the engine makes at most **two repair attempts** (three prompt attempts total). Repair prompts expose only `final_answer` when the active pi session supports tool restriction. Clean exhaustion throws `WorkflowStructuredOutputError` with code `WORKFLOW_STRUCTURED_OUTPUT_NONCOMPLIANCE`; provider failures and host cancellation still propagate unchanged.
 
@@ -420,6 +472,21 @@ Use explicit `model` or `thinkingLevel` only when that one call intentionally
 overrides its profile.
 
 `tools` is a strict allowlist. If you set `tools: ["read", "bash"]`, extension tools such as `ast-grep`, `mgrep`, `fffind`, or `ffgrep` are hidden from that subagent. Add `toolHints: ["search"]` to dynamically expose installed grep/find/search-like tools while keeping the concrete base allowlist portable. Use `toolHints: ["external-search"]` for installed web search, browsing, and URL-extraction tools; `requireToolHints: true` fails before prompting unless each requested capability matched. The built-in advisory workflows use `tools: ["read", "bash", "grep", "find", "ls"]` plus `toolHints: ["search"]`.
+
+Use `writeAllow` for defense-in-depth around a mutating agent:
+
+```ts
+await agent("Update generated TypeScript and its tests only.", {
+  tools: ["read", "edit", "write", "bash"],
+  isolation: "worktree",
+  writeAllow: ["src/**/*.ts", "tests/**/*.test.ts"],
+  profile: "medium",
+});
+```
+
+Patterns are workspace-relative globs: `*` and `?` do not cross `/`; `**` does. An empty array makes intercepted writes read-only. `edit`/`write` paths are resolved against the agent session workspace, reject absolute paths outside it, `..` segments, and symlink escapes, then must match a glob. Under `isolation: "worktree"`, the workspace is that disposable worktree—not the user's main checkout. Changing `writeAllow` changes the agent replay identity.
+
+The same subagent `tool_call` hook best-effort scans common bash mutation forms: redirects, `tee`, `mv`, `cp`, `rm`, `install`, `sed -i`, `dd of=`, mutating `git` forms, wrappers such as `sudo`/`env`/`timeout`, `xargs`, and `cd` chains. A refusal is returned to the subagent as a tool error and logged in workflow progress with “tool refused”. This is **not a shell sandbox**: dynamic paths, variables, command substitution, scripts/interpreters, uncommon utilities, aliases, and opaque shell syntax may evade static inspection. Keep tool exposure minimal, prefer direct `edit`/`write`, use worktree isolation for mutations, and do not use `writeAllow` as the only boundary for hostile code.
 
 Subagents receive no skills by default. Opt in per agent with `skills: ["skill-name"]`; if `tools` is also restricted, the engine automatically keeps `read` available so the subagent can load the selected `SKILL.md`. When `skills` is omitted, clear prompt text such as `/skill:name`, `include skill name`, or `use the name skill` is also treated as an opt-in. Pass `skills: []` to suppress that inference.
 

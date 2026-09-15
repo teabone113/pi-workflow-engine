@@ -12,7 +12,7 @@ import {
   type JournalLookup,
   type WorkflowJournal,
 } from "../.pi/extensions/pi-workflow-engine/src/journal.ts";
-import type { AgentResumeContext } from "../.pi/extensions/pi-workflow-engine/src/resume-context.ts";
+import { isAgentResumeContext, type AgentResumeContext } from "../.pi/extensions/pi-workflow-engine/src/resume-context.ts";
 import { createWorkflowUsageRecorder } from "../.pi/extensions/pi-workflow-engine/src/usage.ts";
 import {
   DEFAULT_SESSION_MODEL,
@@ -40,6 +40,7 @@ test("runAgent resume cache uses effective model identity rather than model ref 
   let observedModel: AgentResumeContext["session"]["model"] | undefined;
   const journal: WorkflowJournal = {
     lookup(_key, identity) {
+      if (!isAgentResumeContext(identity)) throw new Error("expected agent resume identity");
       observedModel = identity.session.model;
       return { hit: true, value: "cached-value" };
     },
@@ -72,6 +73,7 @@ test("runAgent invalidates resume cache when the inherited host model changes", 
   const opts = { label: "inherited-model-cache", resume: "read-only" as const, resumeInputs: [] };
   const journal: WorkflowJournal = {
     lookup(_key, identity) {
+      if (!isAgentResumeContext(identity)) throw new Error("expected agent resume identity");
       return identity.session.model.id === hostA.id
         ? { hit: true, value: "cached-value" }
         : { hit: false, reason: "effective model changed" };

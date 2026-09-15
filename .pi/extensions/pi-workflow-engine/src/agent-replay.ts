@@ -7,6 +7,7 @@ import { FINAL_TOOL } from "./agent-session.ts";
 import type { AgentWorkspace, IsolatedAgentWorkspace } from "./agent-workspace.ts";
 import { captureAgentJournalKey } from "./journal.ts";
 import { unknownErrorMessage } from "./unknown-error.ts";
+import { recorderForJournal, type RecordedCallReservation } from "./recorded.ts";
 import {
   captureRepositoryMutationGuard,
   captureIsolatedRepositoryContext,
@@ -112,14 +113,15 @@ export async function captureReplayIdentity(input: {
 
 export async function lookupReplayResult(input: {
   readonly rc: RunContext;
-  readonly key: string;
+  readonly recordedCall: RecordedCallReservation;
   readonly identity: AgentResumeContext;
   readonly opts: AgentExecutionOptions;
   readonly workspace: AgentWorkspace;
 }): Promise<{ readonly hit: true; readonly result: unknown } | { readonly hit: false; readonly reason?: string }> {
-  const cached = input.rc.journal.lookup(input.key, input.identity, {
-    allowWorkflowSourceMismatch: input.rc.resumeEditedWorkflow,
+  const recorder = input.rc.recorder ?? recorderForJournal(input.rc.journal, {
+    resumeEditedWorkflow: input.rc.resumeEditedWorkflow,
   });
+  const cached = recorder.lookup(input.recordedCall, input.identity);
   if (!cached.hit) return cached;
   const validation = await validateCachedResult(cached.value, input.opts, input.rc, input.workspace);
   return validation.ok
@@ -162,8 +164,9 @@ export async function settleAgentAttempt(input: {
   readonly tags: AgentRunTags;
   readonly replay: AgentReplayPlan;
   readonly outcome: AgentAttemptResult;
+  readonly recordedCall?: RecordedCallReservation;
 }): Promise<AgentAttemptSettlement> {
-  const { rc, label, replay, outcome } = input;
+  const { rc, label, replay, outcome, recordedCall } = input;
   if (outcome.kind === "live-unrecordable") {
     recordAgentResultSource(rc, "live");
     return { kind: "done", result: outcome.result };
@@ -185,7 +188,8 @@ export async function settleAgentAttempt(input: {
     return { kind: "done", result: outcome.result };
   }
 
-  await recordJournalResult(rc, label, replay.key, outcome.result, outcome.identity);
+  if (!recordedCall) throw new Error("Replayable agent result did not retain its recorded sequence.");
+  await recordJournalResult(rc, label, recordedCall, outcome.result, outcome.identity);
   if (outcome.kind === "cache-hit") {
     rc.progress.log(`${label}: using cached result from workflow journal`);
     rc.perf.counter("agent.cache_hit", 1, input.tags);
@@ -356,15 +360,20 @@ async function captureCurrentRepository(
 async function recordJournalResult(
   rc: RunContext,
   label: string,
-  key: string,
+  recordedCall: RecordedCallReservation,
   result: unknown,
   identity: AgentResumeContext,
 ): Promise<void> {
   try {
-    const recorded = await rc.journal.record(key, result, identity);
-    if (!recorded.ok) {
-      rc.progress.log(`${label}: workflow journal write failed (${recorded.error}); future resume may be incomplete`);
-    }
+    const recorder = rc.recorder ?? recorderForJournal(rc.journal, {
+      resumeEditedWorkflow: rc.resumeEditedWorkflow,
+    });
+    await recorder.record(recordedCall, result, identity, {
+      tolerateRecordFailure: true,
+      onRecordFailure: (message) => {
+        rc.progress.log(`${label}: workflow journal write failed (${message}); future resume may be incomplete`);
+      },
+    });
   } catch (error) {
     rc.progress.log(`${label}: workflow journal write failed (${unknownErrorMessage(error)}); future resume may be incomplete`);
   }

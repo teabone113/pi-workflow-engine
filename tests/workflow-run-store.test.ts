@@ -132,18 +132,20 @@ test("workflow run records enforce queued running paused and terminal transition
   );
 });
 
-test("run records persist the explicit edited-workflow resume policy", () => {
+test("run records persist explicit edited-workflow and manual-effect resume policies", () => {
   const record = createWorkflowRunRecord({
     runId: "edited-resume-policy",
     workflow: workflow(),
     options: resolveWorkflowRunOptions({
       resumeFromRunId: "prior-run",
       resumeEditedWorkflow: true,
+      resumeRerunEffects: true,
     }, {}),
     progress: progress("edited-resume-policy"),
   });
   assert.equal(record.options.resumeFromRunId, "prior-run");
   assert.equal(record.options.resumeEditedWorkflow, true);
+  assert.equal(record.options.resumeRerunEffects, true);
 });
 
 test("background provider limits persist a bounded resumable pause record", async () => {

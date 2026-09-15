@@ -110,7 +110,8 @@ export function formatWorkflowRunDetails(
     `State: ${workflowRunStateLabel(record.state)}`,
     `Age: ${formatDuration(Math.max(0, now - record.createdAt))}`,
     `Duration: ${formatWorkflowRunDuration(record, now)}`,
-    `Phase: ${record.progress.currentPhase}`,
+    `Phase: ${record.currentPhase ?? record.progress.currentPhase}`,
+    `Highest recorded sequence: ${record.highestSequence ?? 0}`,
     `Actions: ${availableWorkflowRunActions(record, active).join(", ")}`,
   ];
   if (usage) lines.push(usage);
@@ -118,6 +119,15 @@ export function formatWorkflowRunDetails(
   const cachedAgents = record.progress.counters.find((counter) => counter.key === "resume.cached")?.value ?? 0;
   const liveAgents = record.progress.counters.find((counter) => counter.key === "resume.live")?.value ?? 0;
   if (cachedAgents > 0 || liveAgents > 0) lines.push(`Resume calls: ${cachedAgents} cached, ${liveAgents} live`);
+  if (record.state === "paused" && record.reason) lines.push(`Paused reason: ${record.reason}`);
+  if (record.state === "paused" && record.gate) {
+    lines.push(
+      `Owner gate: ${record.gate.name}`,
+      `Reviewed digest: ${record.gate.reviewedDigest}`,
+      `Waiting for: ${record.gate.choices.join(", ")}`,
+      `Answer command: /workflow:answer ${record.runId} <choice>${record.gate.textPrompt ? " <text>" : " [text]"}`,
+    );
+  }
   if (record.state === "paused" && record.pause?.kind === "provider_usage_limit") {
     lines.push(
       `Provider limit attempt: ${record.pause.attempt}/${record.pause.maxAttempts}`,

@@ -2,6 +2,7 @@ import type { Api, Model } from "@earendil-works/pi-ai";
 import type {
   AgentSession,
   CreateAgentSessionOptions,
+  ExtensionContext,
   ModelRegistry,
 } from "@earendil-works/pi-coding-agent";
 import type { WorkflowBudget } from "./budget.ts";
@@ -11,6 +12,7 @@ import type { AgentRetryScheduler } from "./agent-retry.ts";
 import type { ResolvedWorkflowModelProfiles } from "./model-profiles.ts";
 import type { WorkflowJournal } from "./journal.ts";
 import type { PerfSink } from "./perf.ts";
+import type { WorkflowRecorder } from "./recorded.ts";
 import type { AgentOptions, WorkflowProgressEvent } from "./types.ts";
 import type { WorkflowUsageSink } from "./usage.ts";
 import type { WorktreeBaseline, WorktreeRegistry } from "./worktree.ts";
@@ -54,6 +56,9 @@ interface RunContextBase {
   agentRetries: number;
   pauseOnProviderUsageLimit?: boolean;
   resumeEditedWorkflow?: boolean;
+  resumeRerunEffects?: boolean;
+  runId?: string;
+  ownerContext?: Pick<ExtensionContext, "hasUI" | "ui" | "signal">;
   retryScheduler: AgentRetryScheduler;
   modelProfiles: ResolvedWorkflowModelProfiles;
   progress: AgentProgress;
@@ -62,6 +67,8 @@ interface RunContextBase {
   usage: WorkflowUsageSink;
   budget: WorkflowBudget;
   journal: WorkflowJournal;
+  /** Shared recorded-call allocator. Optional only for legacy tests/programmatic contexts. */
+  recorder?: WorkflowRecorder;
   worktrees: WorktreeRegistry;
 }
 
