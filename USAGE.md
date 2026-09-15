@@ -252,7 +252,7 @@ During a run, pi shows live phases and subagent status. Use `--inspect` if you w
 
 Every workflow run writes a versioned project-local record to `.pi/.workflow-runs/<run-id>.run.json`; its generalized recorded-call journal is `.pi/.workflow-runs/<run-id>.jsonl`. The same run ID appears in execution metadata, progress snapshots, result details, and both filenames. Records distinguish `queued`, `running`, `completed`, `failed`, `stopped`, and `paused` lifecycle states and retain resolved scalar options, timestamps, compact progress, the current phase, highest reserved journal sequence, a sanitized pause reason/payload, summary usage, and the final result or error.
 
-Record replacement is atomic, corrupt or unsupported-version files are ignored independently, and the newest 50 run records are retained. Journal retention remains 50 files. Both record and journal files are excluded from repository resume fingerprints, so checkpoint writes do not invalidate replay.
+Record replacement is atomic, corrupt or unsupported-version files are ignored independently, and the newest 50 run records are retained. Journal retention remains 50 files; pruning a stale run record also removes its matching journal and artifact directory, and orphaned artifact directories are cleaned up. Durable run storage is excluded from repository resume fingerprints, so checkpoint and artifact writes do not invalidate replay.
 
 Persistence is intentionally bounded and private by default. Raw workflow args, prompts, subagent transcripts, progress logs, lane details, agent errors, environment data, credentials, and tool-output-shaped fields are not stored. Final results are limited to bounded plain JSON; credential- and transcript-shaped fields are redacted, and unsupported or cyclic results are marked unavailable instead of executing accessors or breaking the workflow. Loading history only parses these data files and never imports or executes workflow code.
 
@@ -304,6 +304,10 @@ In TUI/RPC UI mode the context, bounded review preview, digest, and choices are 
 ```
 
 `/workflow:answer` validates the choice/text against the persisted gate, appends the external decision to the source run journal at the gate's original sequence, then automatically starts a new background run with `resumeFromRunId`. The resumed `gate()` re-computes the current review digest before accepting that decision. Only registered file workflows without redacted arguments can be relaunched; inline and argument-bearing paused runs remain inspectable but their executable input is intentionally not persisted.
+
+A gate reached in `print` or `json` mode always pauses because those finite processes have no interactive owner UI; headless CI can never auto-approve it. Reopen the project in a long-lived TUI/RPC session to answer and resume an eligible registered workflow.
+
+`WorkflowGatePauseError` is fatal to its orchestration scope. If a gate pauses inside `parallel()` or `pipeline()`, the engine aborts queued and in-flight siblings before returning the durable pause. Calls that completed and reached the journal remain replayable; interrupted siblings and the undecided gate have no completed entry and run or pause again after resume. Put a gate after a fan-out barrier when all sibling results must finish before owner review.
 
 ### Recent runs and lifecycle actions
 

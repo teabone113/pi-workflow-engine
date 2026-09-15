@@ -7,7 +7,7 @@ import { defaultAgentRetryScheduler, type AgentRetryScheduler } from "./agent-re
 import { resolveWorkflowModelProfiles, type ResolvedWorkflowModelProfiles } from "./model-profiles.ts";
 import { abortReason, isWorkflowPauseError, linkAbortSignal, throwIfAborted } from "./cancellation.ts";
 import { createBudget } from "./budget.ts";
-import { runAgent, type AgentExecutionOptions, type RunContext } from "./agent-runner.ts";
+import { runAgent, type AgentExecutionOptions, type CreateAgentSession, type RunContext } from "./agent-runner.ts";
 import { ProgressTracker } from "./progress.ts";
 import { createPerfRecorder, type PerfSink, type PerfSnapshot } from "./perf.ts";
 import { createWorkflowUsageRecorder, type WorkflowUsageSink } from "./usage.ts";
@@ -93,6 +93,8 @@ type Outcome<T> =
   | { readonly ok: false; readonly error: unknown };
 
 export interface WorkflowEngineDependencies {
+  /** Test/programmatic session factory override; production uses Pi's in-process session services. */
+  readonly createSession?: CreateAgentSession;
   readonly worktrees?: WorktreeRegistry;
   readonly retryScheduler?: AgentRetryScheduler;
   readonly modelProfiles?: ResolvedWorkflowModelProfiles;
@@ -214,6 +216,7 @@ export async function runResolvedWorkflow(
       journal,
       recorder,
       worktrees,
+      createSession: dependencies.createSession,
     };
 
     // perf.total_ms wraps the whole tree: sub-workflows run inside this span via api.workflow().
@@ -514,25 +517,26 @@ export async function runWorkflowWithContext(
   const gate: WorkflowApi["gate"] = async (name, gateOpts) => {
     throwIfAborted(rc.signal);
     const prepared = prepareWorkflowGate(opts.progressNamespace, name, gateOpts);
+    const reservation = recorder.reserve("gate", prepared.key);
+    const identity = recordedIdentity(prepared.identity);
     for (const item of prepared.review) {
       if (typeof item !== "string" && !await validateWorkflowArtifact(rc.cwd, item)) {
         throw new WorkflowArtifactIntegrityError(`Gate ${name} received artifact ${item.name} that failed integrity validation.`);
       }
     }
-    const identity = recordedIdentity(prepared.identity);
-    return await recorder.recorded(
-      "gate",
-      prepared.key,
-      identity,
-      async (reservation) => {
-        const decision = await requestGateDecision(rc.ownerContext, prepared);
-        throwIfAborted(rc.signal);
-        if (decision) return decision;
-        if (!rc.runId) throw new Error("gate() requires a top-level workflow run id");
-        throw new WorkflowGatePauseError(rc.runId, gatePauseData(prepared, reservation, identity));
-      },
-      { validate: (value) => isGateDecision(value, prepared) },
-    );
+    const cached = recorder.lookup(reservation, identity);
+    if (cached.hit && isGateDecision(cached.value, prepared)) {
+      await recorder.record(reservation, cached.value, identity);
+      return cached.value;
+    }
+    const decision = await requestGateDecision(rc.ownerContext, prepared);
+    if (!decision) {
+      if (!rc.runId) throw new Error("gate() requires a top-level workflow run id");
+      throw new WorkflowGatePauseError(rc.runId, gatePauseData(prepared, reservation, identity));
+    }
+    throwIfAborted(rc.signal);
+    await recorder.record(reservation, decision, identity);
+    return decision;
   };
 
   const workflow: WorkflowApi["workflow"] =

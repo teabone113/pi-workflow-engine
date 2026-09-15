@@ -120,15 +120,17 @@ export async function findBashWriteViolation(
       return undefined;
     }
 
-    const commandIndex = executable.findIndex((token) => WRITE_COMMANDS.has(basenameCommand(token)));
-    if (commandIndex < 0) return undefined;
-    const argv = executable.slice(commandIndex);
-    for (const target of writeTargets(argv)) {
+    const argv = executable;
+    const command = basenameCommand(argv[0]!);
+    if (!WRITE_COMMANDS.has(command)) return undefined;
+    const mutation = mutationTargets(argv, cwd);
+    for (const target of mutation.targets) {
       if (target === "<unknown>") {
         return { path: target, reason: `is modified by ${argv.slice(0, 2).join(" ")} but cannot be scoped safely` };
       }
+      if (isOutputDevice(target) && command === "tee") continue;
       if (containsOpaqueShellSyntax(target)) continue;
-      const violation = await checkWriteTarget(target, policy, cwd);
+      const violation = await checkWriteTarget(target, policy, mutation.cwd);
       if (violation) return violation;
     }
     return undefined;
@@ -146,21 +148,32 @@ export async function findBashWriteViolation(
   return await inspect();
 }
 
-function writeTargets(argv: readonly string[]): string[] {
+interface MutationTargets {
+  readonly targets: string[];
+  readonly cwd: string;
+}
+
+function mutationTargets(argv: readonly string[], cwd: string): MutationTargets {
   const command = basenameCommand(argv[0] ?? "");
-  if (command === "tee") return positionalArguments(argv.slice(1), new Set(["-a", "--append", "-i", "--ignore-interrupts"]));
-  if (command === "mv" || command === "cp") return transferTargets(argv.slice(1));
-  if (command === "install") return installTargets(argv.slice(1));
-  if (command === "rm") {
-    const targets = positionalArguments(argv.slice(1));
-    return targets.length > 0 ? targets : ["<unknown>"];
+  if (command === "git") {
+    const invocation = parseGitInvocation(argv.slice(1), cwd);
+    return {
+      targets: invocation.valid ? gitTargets(invocation.args) : ["<unknown>"],
+      cwd: invocation.cwd,
+    };
   }
-  if (command === "sed") return sedTargets(argv.slice(1));
-  if (command === "dd") {
-    return argv.slice(1).flatMap((token) => token.startsWith("of=") && token.length > 3 ? [token.slice(3)] : []);
+  let targets: string[] = [];
+  if (command === "tee") targets = positionalArguments(argv.slice(1), new Set(["-a", "--append", "-i", "--ignore-interrupts"]));
+  else if (command === "mv" || command === "cp") targets = transferTargets(argv.slice(1));
+  else if (command === "install") targets = installTargets(argv.slice(1));
+  else if (command === "rm") {
+    const positional = positionalArguments(argv.slice(1));
+    targets = positional.length > 0 ? positional : ["<unknown>"];
+  } else if (command === "sed") targets = sedTargets(argv.slice(1));
+  else if (command === "dd") {
+    targets = argv.slice(1).flatMap((token) => token.startsWith("of=") && token.length > 3 ? [token.slice(3)] : []);
   }
-  if (command === "git") return gitTargets(argv.slice(1));
-  return [];
+  return { targets, cwd };
 }
 
 function transferTargets(args: readonly string[]): string[] {
@@ -200,37 +213,91 @@ function sedTargets(args: readonly string[]): string[] {
   return positional.length > 0 ? positional : ["<unknown>"];
 }
 
-function gitTargets(args: readonly string[]): string[] {
+interface ParsedGitInvocation {
+  readonly args: readonly string[];
+  readonly cwd: string;
+  readonly valid: boolean;
+}
+
+function parseGitInvocation(args: readonly string[], initialCwd: string): ParsedGitInvocation {
+  let cwd = initialCwd;
+  let workTree: string | undefined;
   let index = 0;
   while (index < args.length) {
     const token = args[index]!;
-    if (token === "-C" || token === "-c" || token === "--git-dir" || token === "--work-tree") {
+    if (token === "-C") {
+      const value = args[index + 1];
+      if (!value || containsOpaqueShellSyntax(value)) return { args: [], cwd, valid: false };
+      cwd = isAbsolute(value) ? resolve(value) : resolve(cwd, value);
       index += 2;
       continue;
     }
-    if (token.startsWith("-")) {
+    if (token.startsWith("-C") && token.length > 2) {
+      const value = token.slice(2);
+      if (containsOpaqueShellSyntax(value)) return { args: [], cwd, valid: false };
+      cwd = isAbsolute(value) ? resolve(value) : resolve(cwd, value);
+      index++;
+      continue;
+    }
+    if (token === "--work-tree") {
+      const value = args[index + 1];
+      if (!value || containsOpaqueShellSyntax(value)) return { args: [], cwd: workTree ?? cwd, valid: false };
+      workTree = isAbsolute(value) ? resolve(value) : resolve(cwd, value);
+      index += 2;
+      continue;
+    }
+    if (token.startsWith("--work-tree=")) {
+      const value = token.slice("--work-tree=".length);
+      if (!value || containsOpaqueShellSyntax(value)) return { args: [], cwd: workTree ?? cwd, valid: false };
+      workTree = isAbsolute(value) ? resolve(value) : resolve(cwd, value);
+      index++;
+      continue;
+    }
+    if (token === "-c" || token === "--git-dir") {
+      if (!args[index + 1]) return { args: [], cwd, valid: false };
+      index += 2;
+      continue;
+    }
+    if (token.startsWith("--git-dir=") || (token.startsWith("-c") && token.length > 2) || token.startsWith("-")) {
       index++;
       continue;
     }
     break;
   }
-  const subcommand = args[index];
+  return { args: args.slice(index), cwd: workTree ?? cwd, valid: true };
+}
+
+function gitTargets(args: readonly string[]): string[] {
+  const subcommand = args[0];
   if (!subcommand) return [];
-  const rest = args.slice(index + 1);
+  const rest = args.slice(1);
   if (subcommand === "mv") return transferTargets(rest);
   if (subcommand === "rm") return positionalArguments(rest);
-  if (subcommand === "clean") {
-    const paths = argumentsAfterDoubleDash(rest);
-    if (paths.length > 0) return paths;
-    const positional = positionalArguments(rest);
-    return positional.length > 0 ? positional : ["."];
-  }
+  if (subcommand === "clean") return gitCleanTargets(rest);
   if (subcommand === "checkout" || subcommand === "restore") {
     const paths = argumentsAfterDoubleDash(rest);
     return paths.length > 0 ? paths : ["<unknown>"];
   }
   if (subcommand === "apply" || subcommand === "stash") return ["<unknown>"];
   return [];
+}
+
+function gitCleanTargets(args: readonly string[]): string[] {
+  const afterDoubleDash = argumentsAfterDoubleDash(args);
+  if (afterDoubleDash.length > 0) return afterDoubleDash;
+  const paths: string[] = [];
+  for (let index = 0; index < args.length; index++) {
+    const token = args[index]!;
+    if (token === "-e" || token === "--exclude") {
+      if (!args[index + 1]) return ["<unknown>"];
+      index++;
+      continue;
+    }
+    if (token.startsWith("--exclude=") || token.startsWith("-e") && token.length > 2) continue;
+    if (token.startsWith("-")) continue;
+    paths.push(token);
+  }
+  return paths.length > 0 ? paths : ["."];
 }
 
 async function redirectViolation(
@@ -243,6 +310,7 @@ async function redirectViolation(
     const attached = /^(?:\d*|&)(>>?|>\|)(.+)$/.exec(token);
     if (attached?.[2]) {
       const target = attached[2];
+      if (isOutputDevice(target)) continue;
       if (!containsOpaqueShellSyntax(target)) {
         const violation = await checkWriteTarget(target, policy, cwd);
         if (violation) return violation;
@@ -252,6 +320,10 @@ async function redirectViolation(
     if (!/^(?:\d*|&)?(?:>|>>|>\|)$/.test(token)) continue;
     const target = tokens[index + 1];
     if (!target) return { path: "<unknown>", reason: "is an incomplete shell redirection" };
+    if (isOutputDevice(target)) {
+      index++;
+      continue;
+    }
     if (!containsOpaqueShellSyntax(target)) {
       const violation = await checkWriteTarget(target, policy, cwd);
       if (violation) return violation;
@@ -465,6 +537,10 @@ function normalizeRelativePath(path: string): string {
 
 function hasParentSegment(path: string): boolean {
   return path.replaceAll("\\", "/").split("/").includes("..");
+}
+
+function isOutputDevice(value: string): boolean {
+  return value === "/dev/null" || value === "/dev/stdout" || value === "/dev/stderr";
 }
 
 function containsOpaqueShellSyntax(value: string): boolean {

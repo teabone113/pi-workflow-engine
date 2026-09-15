@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { mkdir, readFile, readdir, rename, rm, stat, writeFile } from "node:fs/promises";
+import { lstat, mkdir, readFile, readdir, rename, rm, stat, writeFile } from "node:fs/promises";
 import { basename, dirname, join } from "node:path";
 import { validateWorkflowRunId, WORKFLOW_RUNS_DIR } from "./journal.ts";
 import type { WorkflowProgressSnapshot } from "./progress-types.ts";
@@ -80,17 +80,48 @@ export class ProjectWorkflowRunStore implements WorkflowRunStore {
           const path = join(dir, file);
           try {
             const info = await stat(path);
-            return { path, mtimeMs: info.mtimeMs };
+            if (!info.isFile()) return undefined;
+            return {
+              path,
+              runId: file.slice(0, -WORKFLOW_RUN_RECORD_SUFFIX.length),
+              mtimeMs: info.mtimeMs,
+            };
           } catch {
             return undefined;
           }
         }),
     );
-    const stale = candidates
-      .filter((entry): entry is { readonly path: string; readonly mtimeMs: number } => entry !== undefined)
-      .sort((left, right) => right.mtimeMs - left.mtimeMs)
-      .slice(Math.max(0, keep));
-    await Promise.all(stale.map((entry) => rm(entry.path, { force: true }).catch(() => undefined)));
+    const ordered = candidates
+      .filter((entry): entry is { readonly path: string; readonly runId: string; readonly mtimeMs: number } => entry !== undefined)
+      .sort((left, right) => right.mtimeMs - left.mtimeMs);
+    const stale = ordered.slice(Math.max(0, keep));
+    const recordedRunIds = new Set(ordered.map((entry) => entry.runId));
+    const orphanArtifactDirectories = await Promise.all(
+      files
+        .filter((file) => !recordedRunIds.has(file))
+        .map(async (file) => {
+          try {
+            if (validateWorkflowRunId(file) !== file) return undefined;
+            const path = join(dir, file);
+            const runInfo = await lstat(path);
+            if (!runInfo.isDirectory() || runInfo.isSymbolicLink()) return undefined;
+            const artifactInfo = await lstat(join(path, "artifacts"));
+            return artifactInfo.isDirectory() && !artifactInfo.isSymbolicLink() ? path : undefined;
+          } catch {
+            return undefined;
+          }
+        }),
+    );
+    await Promise.all([
+      ...stale.flatMap((entry) => [
+        rm(entry.path, { force: true }).catch(() => undefined),
+        rm(join(dir, `${entry.runId}.jsonl`), { force: true }).catch(() => undefined),
+        rm(join(dir, entry.runId), { recursive: true, force: true }).catch(() => undefined),
+      ]),
+      ...orphanArtifactDirectories
+        .filter((path): path is string => path !== undefined)
+        .map((path) => rm(path, { recursive: true, force: true }).catch(() => undefined)),
+    ]);
   }
 }
 

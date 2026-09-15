@@ -137,7 +137,7 @@ export async function requestGateDecision<C extends readonly string[]>(
       by: "ui",
     };
   } catch (error) {
-    if (dialogController?.signal.aborted && !host.signal?.aborted) return undefined;
+    if (dialogController?.signal.aborted) return undefined;
     throw error;
   } finally {
     if (timer) clearTimeout(timer);
@@ -184,7 +184,10 @@ export function commandGateDecision(
   };
 }
 
-export function isGateDecision(value: unknown, gate: Pick<PreparedWorkflowGate, "choices" | "reviewedDigest">): value is WorkflowGateDecision {
+export function isGateDecision<C extends readonly string[]>(
+  value: unknown,
+  gate: Pick<PreparedWorkflowGate<C>, "choices" | "reviewedDigest">,
+): value is WorkflowGateDecision<C[number]> {
   if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
   const decision = value as Record<string, unknown>;
   return (

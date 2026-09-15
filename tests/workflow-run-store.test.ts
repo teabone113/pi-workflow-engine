@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { test } from "bun:test";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { runWorkflow } from "../.pi/extensions/pi-workflow-engine/src/engine.ts";
-import { WORKFLOW_RUNS_DIR } from "../.pi/extensions/pi-workflow-engine/src/journal.ts";
+import { WORKFLOW_RUNS_DIR, workflowJournalPath } from "../.pi/extensions/pi-workflow-engine/src/journal.ts";
 import { resolveWorkflowRunOptions } from "../.pi/extensions/pi-workflow-engine/src/options.ts";
 import type { WorkflowProgressSnapshot } from "../.pi/extensions/pi-workflow-engine/src/progress-types.ts";
 import type { LoadedWorkflow, WorkflowRunMetadata } from "../.pi/extensions/pi-workflow-engine/src/types.ts";
@@ -469,7 +469,7 @@ test("durable writer coalesces progress while preserving the terminal record", a
   assert.ok(saved.length < 4);
 });
 
-test("run record retention keeps only the newest configured records", async () => {
+test("run record retention removes stale journals and artifact directories with their records", async () => {
   const cwd = await mkdtemp(join(tmpdir(), "pi-workflow-run-prune-"));
   try {
     const store = new ProjectWorkflowRunStore(cwd);
@@ -478,9 +478,21 @@ test("run record retention keeps only the newest configured records", async () =
     await store.save(completedRecord("middle", 3));
     await new Promise((resolve) => setTimeout(resolve, 5));
     await store.save(completedRecord("new", 4));
+    for (const runId of ["old", "middle", "new", "orphaned"]) {
+      const artifactDir = join(cwd, WORKFLOW_RUNS_DIR, runId, "artifacts");
+      await mkdir(artifactDir, { recursive: true });
+      await writeFile(join(artifactDir, "result.json"), "{}\n", "utf8");
+      if (runId !== "orphaned") await writeFile(workflowJournalPath(cwd, runId), "", "utf8");
+    }
 
     await store.prune(1);
     assert.deepEqual((await store.list()).map((record) => record.runId), ["new"]);
+    for (const runId of ["old", "middle", "orphaned"]) {
+      await assert.rejects(stat(join(cwd, WORKFLOW_RUNS_DIR, runId)));
+      await assert.rejects(stat(workflowJournalPath(cwd, runId)));
+    }
+    assert.equal((await stat(join(cwd, WORKFLOW_RUNS_DIR, "new", "artifacts", "result.json"))).isFile(), true);
+    assert.equal((await stat(workflowJournalPath(cwd, "new"))).isFile(), true);
   } finally {
     await rm(cwd, { recursive: true, force: true });
   }

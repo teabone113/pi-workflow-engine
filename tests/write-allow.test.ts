@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
-import { mkdtemp, mkdir, rm, symlink } from "node:fs/promises";
+import { execFileSync } from "node:child_process";
+import { mkdtemp, mkdir, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "bun:test";
@@ -9,6 +10,7 @@ import {
   findBashWriteViolation,
   toolWriteViolation,
 } from "../.pi/extensions/pi-workflow-engine/src/write-allow.ts";
+import { WorktreeRegistry } from "../.pi/extensions/pi-workflow-engine/src/worktree.ts";
 
 async function withWorkspace(run: (cwd: string) => Promise<void>): Promise<void> {
   const cwd = await mkdtemp(join(tmpdir(), "pi-workflow-write-allow-"));
@@ -51,7 +53,10 @@ test("bash mutation scanning covers redirects, wrappers, transfers, removal, sed
       "sed -i s/a/b/ README.md",
       "dd if=src/main.ts of=README.md",
       "git clean -fd",
+      "git clean -fd -e 'src/**'",
       "git checkout -- README.md",
+      "git -C /tmp checkout -- src/main.ts",
+      "git --work-tree=/tmp restore -- src/main.ts",
       "printf README.md | xargs rm",
       "cd src && printf x > ../README.md",
     ];
@@ -60,17 +65,63 @@ test("bash mutation scanning covers redirects, wrappers, transfers, removal, sed
     }
     const allowed = [
       "printf x > src/out.ts",
+      "npm install",
+      "bun install",
+      "pip install requests",
+      "make install",
+      "ls > /dev/null",
+      "cat src/main.ts | tee /dev/stdout",
+      "printf warning | tee /dev/stderr",
       "printf x | tee src/out.ts",
       "cp README.md src/copied.ts",
       "sed -i s/a/b/ src/main.ts",
       "cd src && printf x > nested.ts",
       "git rm -- src/main.ts",
+      "git clean -fd -- src/cache",
+      "git -C src checkout -- main.ts",
+      "git -C /tmp status",
+      "git commit -m 'rm old code'",
       "printf read-only",
     ];
     for (const command of allowed) {
       assert.equal(await findBashWriteViolation(command, policy), undefined, `expected allow for: ${command}`);
     }
   });
+});
+
+test("writeAllow for an isolated agent is rooted in its disposable worktree", async () => {
+  const repo = await mkdtemp(join(tmpdir(), "pi-workflow-write-worktree-repo-"));
+  const git = (args: string[]) => execFileSync("git", args, { cwd: repo, stdio: "ignore" });
+  const registry = new WorktreeRegistry(repo);
+  try {
+    git(["init"]);
+    git(["config", "user.email", "test@example.invalid"]);
+    git(["config", "user.name", "Workflow Test"]);
+    await mkdir(join(repo, "src"), { recursive: true });
+    await writeFile(join(repo, "src", "base.ts"), "export {};\n", "utf8");
+    git(["add", "."]);
+    git(["commit", "-m", "base"]);
+
+    const added = await registry.add();
+    if ("error" in added) throw new Error(added.error);
+    const policy = compileWriteAllow(added.path, ["src/**/*.ts"]);
+    assert.equal(
+      await toolWriteViolation({ toolName: "write", input: { path: "src/generated.ts" } }, policy),
+      undefined,
+      "the relative path is allowed inside the agent worktree",
+    );
+    assert.match(
+      (await toolWriteViolation({
+        toolName: "write",
+        input: { path: join(repo, "src", "generated.ts") },
+      }, policy))?.reason ?? "",
+      /outside workspace/,
+      "the same main-checkout path is outside the isolated agent workspace",
+    );
+  } finally {
+    await registry.removeAll().catch(() => undefined);
+    await rm(repo, { recursive: true, force: true });
+  }
 });
 
 test("writeAllow extension blocks tool calls with a visible reason and progress log", async () => {

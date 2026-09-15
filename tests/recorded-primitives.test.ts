@@ -1,20 +1,30 @@
 import assert from "node:assert/strict";
+import { randomUUID } from "node:crypto";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "bun:test";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type { CreateAgentSession } from "../.pi/extensions/pi-workflow-engine/src/agent-runner.ts";
 import { runWorkflow } from "../.pi/extensions/pi-workflow-engine/src/engine.ts";
 import { WorkflowGatePauseError } from "../.pi/extensions/pi-workflow-engine/src/gate.ts";
 import { WorkflowJournalSequenceError, loadJournalEntries, workflowJournalPath } from "../.pi/extensions/pi-workflow-engine/src/journal.ts";
 import { WorkflowManualEffectResumeError } from "../.pi/extensions/pi-workflow-engine/src/run-step.ts";
 import { ProjectWorkflowRunStore } from "../.pi/extensions/pi-workflow-engine/src/workflow-run-store.ts";
 import type { LoadedWorkflow, WorkflowGateDecision } from "../.pi/extensions/pi-workflow-engine/src/types.ts";
+import {
+  assistantTextMessage,
+  createAgentRunnerSession,
+  DEFAULT_SESSION_MODEL,
+  TEST_TOOL,
+  TEST_TOOL_DEFINITION,
+} from "./agent-runner-fixtures.ts";
 
 function context(cwd: string, input: {
   readonly hasUI?: boolean;
-  readonly select?: (title: string, choices: string[]) => Promise<string | undefined>;
+  readonly select?: (title: string, choices: string[], opts?: { readonly signal?: AbortSignal }) => Promise<string | undefined>;
   readonly input?: (title: string) => Promise<string | undefined>;
+  readonly signal?: AbortSignal;
 } = {}): ExtensionContext {
   return {
     cwd,
@@ -22,7 +32,7 @@ function context(cwd: string, input: {
     hasUI: input.hasUI ?? false,
     model: undefined,
     modelRegistry: { find: () => undefined },
-    signal: undefined,
+    signal: input.signal,
     isIdle: () => true,
     sessionManager: {
       getSessionId: () => "recorded-primitives",
@@ -46,6 +56,40 @@ function workflow(name: string, run: LoadedWorkflow["default"]): LoadedWorkflow 
     meta: { name, description: name },
     default: run,
     source: { kind: "fingerprint", fingerprint: `${name}-source` },
+  };
+}
+
+function scriptedTextSessions(input: {
+  readonly prompts: string[];
+  readonly blockPrompt?: string;
+  readonly onBlocked?: () => void;
+  readonly onAbort?: () => void;
+}): CreateAgentSession {
+  return async () => {
+    let lastPrompt = "";
+    return {
+      session: createAgentRunnerSession({
+        messages: [assistantTextMessage("scripted")],
+        model: DEFAULT_SESSION_MODEL,
+        systemPrompt: "Recorded primitives test prompt",
+        thinkingLevel: "low",
+        async prompt(prompt) {
+          lastPrompt = String(prompt);
+          input.prompts.push(lastPrompt);
+          if (lastPrompt === input.blockPrompt) {
+            input.onBlocked?.();
+            await new Promise<void>(() => {});
+          }
+        },
+        async abort() {
+          input.onAbort?.();
+        },
+        getLastAssistantText: () => `agent:${lastPrompt}`,
+        getAllTools: () => [TEST_TOOL],
+        getActiveToolNames: () => [TEST_TOOL.name],
+        getToolDefinition: (name) => name === TEST_TOOL.name ? TEST_TOOL_DEFINITION : undefined,
+      }),
+    };
   };
 }
 
@@ -179,6 +223,193 @@ test("a missing manual-effect run step refuses resume unless explicitly authoriz
     assert.equal(typeof result, "object");
     assert.equal(await readFile(effectPath, "utf8"), "effect");
   } finally {
+    await rm(cwd, { recursive: true, force: true });
+  }
+});
+
+test("an interrupted mixed workflow replays completed agent, run, and artifact calls exactly once", async () => {
+  const interruptedCwd = await mkdtemp(join(tmpdir(), "pi-workflow-interrupted-"));
+  const controlCwd = await mkdtemp(join(tmpdir(), "pi-workflow-control-"));
+  const interruptedEffect = join(tmpdir(), `pi-workflow-effect-${randomUUID()}.txt`);
+  const controlEffect = join(tmpdir(), `pi-workflow-control-effect-${randomUUID()}.txt`);
+  const createMixedWorkflow = (effectPath: string) => workflow("interrupted-mixed", async (api) => {
+    const first = await api.agent("completed", { tools: ["read"], resume: "read-only", resumeInputs: [] });
+    const command = await api.run(`printf x >> ${JSON.stringify(effectPath)}; printf command-result`, { effect: "idempotent" });
+    const artifact = await api.artifact("result.json", { first, command: command.stdout });
+    const tail = await api.agent("interrupt", { tools: ["read"], resume: "read-only", resumeInputs: [] });
+    return { first, command: command.stdout, artifact: { name: artifact.name, sha256: artifact.sha256, bytes: artifact.bytes }, tail };
+  });
+  const blocked = Promise.withResolvers<void>();
+  const aborted = Promise.withResolvers<void>();
+  const firstPrompts: string[] = [];
+  const controller = new AbortController();
+  try {
+    const interruptedRun = runWorkflow(
+      context(interruptedCwd, { signal: controller.signal }),
+      createMixedWorkflow(interruptedEffect),
+      "",
+      { runId: "interrupted-first" },
+      {
+        createSession: scriptedTextSessions({
+          prompts: firstPrompts,
+          blockPrompt: "interrupt",
+          onBlocked: () => blocked.resolve(),
+          onAbort: () => aborted.resolve(),
+        }),
+      },
+    );
+    await blocked.promise;
+    controller.abort(new Error("simulated process interruption"));
+    await assert.rejects(interruptedRun, /simulated process interruption/);
+    await aborted.promise;
+    assert.deepEqual(firstPrompts, ["completed", "interrupt"]);
+    assert.equal(await readFile(interruptedEffect, "utf8"), "x");
+    const sourceEntries = await loadJournalEntries(workflowJournalPath(interruptedCwd, "interrupted-first"));
+    assert.deepEqual(sourceEntries.map((entry) => entry.version === 2 ? entry.kind : "legacy"), ["agent", "run", "artifact"]);
+
+    const resumedPrompts: string[] = [];
+    const resumed = await runWorkflow(
+      context(interruptedCwd),
+      createMixedWorkflow(interruptedEffect),
+      "",
+      { runId: "interrupted-resumed", resumeFromRunId: "interrupted-first" },
+      { createSession: scriptedTextSessions({ prompts: resumedPrompts }) },
+    );
+    assert.deepEqual(resumedPrompts, ["interrupt"], "completed agent must replay while only the interrupted agent reruns");
+    assert.equal(await readFile(interruptedEffect, "utf8"), "x", "completed idempotent command must not execute twice");
+
+    const controlPrompts: string[] = [];
+    const control = await runWorkflow(
+      context(controlCwd),
+      createMixedWorkflow(controlEffect),
+      "",
+      { runId: "interrupted-control" },
+      { createSession: scriptedTextSessions({ prompts: controlPrompts }) },
+    );
+    assert.deepEqual(controlPrompts, ["completed", "interrupt"]);
+    assert.equal(await readFile(controlEffect, "utf8"), "x");
+    assert.deepEqual(resumed, control, "resuming after interruption must produce the uninterrupted result");
+  } finally {
+    await Promise.all([
+      rm(interruptedCwd, { recursive: true, force: true }),
+      rm(controlCwd, { recursive: true, force: true }),
+      rm(interruptedEffect, { force: true }),
+      rm(controlEffect, { force: true }),
+    ]);
+  }
+});
+
+test("a gate timeout pauses without inventing an approval", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "pi-workflow-gate-timeout-"));
+  let timeoutObserved = false;
+  const timedContext = context(cwd, {
+    hasUI: true,
+    select: async (_title, _choices, opts) => await new Promise<string | undefined>((resolve) => {
+      const timedOut = () => {
+        timeoutObserved = true;
+        resolve(undefined);
+      };
+      if (opts?.signal?.aborted) timedOut();
+      else opts?.signal?.addEventListener("abort", timedOut, { once: true });
+    }),
+  });
+  const mod = workflow("gate-timeout", async (api) => await api.gate("timed-review", {
+    review: ["candidate"],
+    timeoutMs: 10,
+  }));
+  try {
+    await assert.rejects(
+      runWorkflow(timedContext, mod, "", { runId: "gate-timeout" }),
+      WorkflowGatePauseError,
+    );
+    assert.equal(timeoutObserved, true);
+    const paused = await new ProjectWorkflowRunStore(cwd).load("gate-timeout");
+    assert.equal(paused?.state, "paused");
+    assert.equal(paused?.state === "paused" ? paused.gate?.name : undefined, "timed-review");
+  } finally {
+    await rm(cwd, { recursive: true, force: true });
+  }
+});
+
+test("host shutdown during a gate dialog preserves the answerable gate payload", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "pi-workflow-gate-host-abort-"));
+  const controller = new AbortController();
+  const dialogOpened = Promise.withResolvers<void>();
+  const abortingContext = context(cwd, {
+    hasUI: true,
+    signal: controller.signal,
+    select: async (_title, _choices, opts) => {
+      dialogOpened.resolve();
+      return await new Promise<string | undefined>((_resolve, reject) => {
+        const abort = () => reject(new Error("dialog aborted by host shutdown"));
+        if (opts?.signal?.aborted) abort();
+        else opts?.signal?.addEventListener("abort", abort, { once: true });
+      });
+    },
+  });
+  const mod = workflow("gate-host-abort", async (api) => await api.gate("shutdown-review", {
+    review: ["candidate"],
+    choices: ["ship", "revise"] as const,
+  }));
+  try {
+    const run = runWorkflow(abortingContext, mod, "", { runId: "gate-host-abort" });
+    await dialogOpened.promise;
+    controller.abort(new Error("host shutdown"));
+    await assert.rejects(run, WorkflowGatePauseError);
+    const paused = await new ProjectWorkflowRunStore(cwd).load("gate-host-abort");
+    assert.equal(paused?.state, "paused");
+    assert.equal(paused?.state === "paused" ? paused.reason : undefined, "gate:shutdown-review");
+    assert.deepEqual(paused?.state === "paused" ? paused.gate?.choices : undefined, ["ship", "revise"]);
+    assert.match(paused?.state === "paused" ? paused.message : "", /\/workflow:answer gate-host-abort/);
+  } finally {
+    await rm(cwd, { recursive: true, force: true });
+  }
+});
+
+test("a gate in parallel aborts in-flight siblings while preserving completed journal entries", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "pi-workflow-parallel-gate-"));
+  const gateChoice = Promise.withResolvers<string | undefined>();
+  const siblingStarted = Promise.withResolvers<void>();
+  const siblingAborted = Promise.withResolvers<void>();
+  const prompts: string[] = [];
+  const mod = workflow("parallel-gate", async (api) => {
+    await api.now();
+    return await api.parallel<unknown>([
+      () => api.gate("parallel-review", { review: ["candidate"] }),
+      () => api.agent("slow-sibling", { tools: ["read"], resume: "read-only", resumeInputs: [] }),
+    ]);
+  });
+  try {
+    const run = runWorkflow(
+      context(cwd, { hasUI: true, select: async () => await gateChoice.promise }),
+      mod,
+      "",
+      { runId: "parallel-gate" },
+      {
+        createSession: scriptedTextSessions({
+          prompts,
+          blockPrompt: "slow-sibling",
+          onBlocked: () => siblingStarted.resolve(),
+          onAbort: () => siblingAborted.resolve(),
+        }),
+      },
+    );
+    await siblingStarted.promise;
+    gateChoice.resolve(undefined);
+    await assert.rejects(run, WorkflowGatePauseError);
+    await siblingAborted.promise;
+    assert.deepEqual(prompts, ["slow-sibling"]);
+    const entries = await loadJournalEntries(workflowJournalPath(cwd, "parallel-gate"));
+    assert.deepEqual(
+      entries.map((entry) => entry.version === 2 ? [entry.sequence, entry.kind] : []),
+      [[1, "now"]],
+      "the completed prefix survives while the gate and interrupted sibling remain unrecorded",
+    );
+    const paused = await new ProjectWorkflowRunStore(cwd).load("parallel-gate");
+    assert.equal(paused?.state, "paused");
+    assert.equal(paused?.state === "paused" ? paused.gate?.sequence : undefined, 2);
+  } finally {
+    gateChoice.resolve(undefined);
     await rm(cwd, { recursive: true, force: true });
   }
 });
