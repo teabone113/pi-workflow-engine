@@ -4,6 +4,7 @@ import { dirname, join } from "node:path";
 import type { AgentOptions } from "./types.ts";
 import type { WorktreeBaseline } from "./worktree.ts";
 import { canonicalizeIdentity } from "./identity-canonicalization.ts";
+import { WorkflowAbortError } from "./cancellation.ts";
 import { unknownErrorMessage } from "./unknown-error.ts";
 import {
   isAgentResumeContext,
@@ -17,18 +18,17 @@ export const WORKFLOW_JOURNAL_KEEP = 50;
 
 export interface JournalEntryV2 {
   readonly version: 2;
-  readonly key: string;
-  readonly result: unknown;
-  readonly identity: AgentResumeContext;
-}
-
-/** Parsed so journals written before effective-session identity can fail closed without aborting resume. */
-export interface LegacyJournalEntryV2 {
-  readonly version: 2;
+  /** Entries written before the generic recorded-call journal omit kind and are agents. */
+  readonly kind?: string;
+  /** New entries carry invocation-order sequence; legacy v2 entries replay by key for compatibility. */
+  readonly sequence?: number;
   readonly key: string;
   readonly result: unknown;
   readonly identity: unknown;
 }
+
+/** Alias retained for source compatibility with callers that distinguish legacy v2 input. */
+export type LegacyJournalEntryV2 = JournalEntryV2;
 
 /** Parsed only so resume can explain why an older entry is not replayed. */
 export interface LegacyJournalEntryV1 {
@@ -38,22 +38,39 @@ export interface LegacyJournalEntryV1 {
   readonly context?: unknown;
 }
 
-export type JournalEntry = LegacyJournalEntryV2 | LegacyJournalEntryV1;
+export type JournalEntry = JournalEntryV2 | LegacyJournalEntryV1;
 
 export type JournalLookup = { readonly hit: true; readonly value: unknown } | { readonly hit: false; readonly reason?: string };
 export type JournalRecordResult = { readonly ok: true } | { readonly ok: false; readonly error: string };
+
+export interface JournalLookupOptions extends ResumeContextComparisonOptions {
+  readonly kind?: string;
+  readonly sequence?: number;
+  /** Edited-workflow resume falls back to key lookup when invocation order changed. */
+  readonly allowSequenceKeyFallback?: boolean;
+}
+
+export interface JournalRecordOptions {
+  readonly kind?: string;
+  readonly sequence?: number;
+}
 
 export type AgentJournalKeyCapture =
   | { readonly kind: "verified"; readonly key: string }
   | { readonly kind: "unverifiable"; readonly reason: string };
 
 export interface WorkflowJournal {
-  lookup(key: string, identity: AgentResumeContext, options?: ResumeContextComparisonOptions): JournalLookup;
-  record(key: string, result: unknown, identity: AgentResumeContext): Promise<JournalRecordResult>;
+  readonly isResuming?: boolean;
+  lookup(key: string, identity: unknown, options?: JournalLookupOptions): JournalLookup;
+  record(key: string, result: unknown, identity: unknown, options?: JournalRecordOptions): Promise<JournalRecordResult>;
 }
 
 export class WorkflowJournalLoadError extends Error {
   override readonly name = "WorkflowJournalLoadError";
+}
+
+export class WorkflowJournalSequenceError extends WorkflowAbortError {
+  override readonly name = "WorkflowJournalSequenceError";
 }
 
 export function createWorkflowRunId(): string {
@@ -115,6 +132,7 @@ function captureAgentCallHash(
         skills: opts.skills,
         schema: opts.schema,
         isolation: opts.isolation,
+        writeAllow: opts.writeAllow,
         worktreeBaseline: worktreeBaseline
           ? {
               ref: worktreeBaseline.ref,
@@ -174,53 +192,149 @@ export async function createWorkflowJournal(options: {
   const priorEntries = options.resumePath ? await loadJournalEntries(options.resumePath, { required: true }) : [];
   await mkdir(dirname(options.writePath), { recursive: true });
   await appendFile(options.writePath, "", "utf8");
-  return createMemoryBackedJournal(priorEntries, options.writePath);
+  return createMemoryBackedJournal(priorEntries, options.writePath, options.resumePath !== undefined);
 }
 
-export function createMemoryBackedJournal(priorEntries: readonly JournalEntry[] = [], writePath?: string): WorkflowJournal {
+export function createMemoryBackedJournal(
+  priorEntries: readonly JournalEntry[] = [],
+  writePath?: string,
+  isResuming = priorEntries.length > 0,
+): WorkflowJournal {
   const priorByKey = new Map<string, JournalEntry[]>();
+  const priorBySequence = new Map<number, JournalEntryV2[]>();
   for (const entry of priorEntries) {
     const entries = priorByKey.get(entry.key) ?? [];
     entries.push(entry);
     priorByKey.set(entry.key, entries);
+    if (entry.version === 2 && entry.sequence !== undefined) {
+      const sequenced = priorBySequence.get(entry.sequence) ?? [];
+      sequenced.push(entry);
+      priorBySequence.set(entry.sequence, sequenced);
+    }
   }
 
+  let appendQueue = Promise.resolve<JournalRecordResult>({ ok: true });
   return {
-    lookup(key, identity, options) {
-      const entries = priorByKey.get(key);
-      if (!entries || entries.length === 0) return { hit: false };
-
-      const current = entries.filter(
-        (entry): entry is JournalEntryV2 => entry.version === 2 && isAgentResumeContext(entry.identity),
-      );
-      if (current.length === 0) {
-        return {
-          hit: false,
-          reason: entries.some((entry) => entry.version === 2)
-            ? "journal entry predates effective replay identity"
-            : "journal entry predates replay contract v2",
-        };
+    isResuming,
+    lookup(key, identity, options = {}) {
+      const kind = options.kind ?? "agent";
+      const sequence = options.sequence;
+      if (sequence !== undefined) {
+        const atSequence = priorBySequence.get(sequence);
+        if (atSequence && atSequence.length > 0) {
+          const exact = atSequence.filter((entry) => journalEntryKind(entry) === kind && entry.key === key);
+          if (exact.length === 0 && !options.allowSequenceKeyFallback) {
+            const found = atSequence[0]!;
+            throw new WorkflowJournalSequenceError(
+              `Workflow resume diverged at recorded sequence ${sequence}: expected ${kind} key "${key}", found ${journalEntryKind(found)} key "${found.key}". Re-run with --resume-edited to allow key-only lookup.`,
+            );
+          }
+          if (exact.length > 0) {
+            const sequenceMatch = lookupMatchingEntries(exact, kind, identity, options);
+            if (sequenceMatch.hit || !options.allowSequenceKeyFallback) return sequenceMatch;
+            return lookupMatchingEntries(priorByKey.get(key) ?? [], kind, identity, options);
+          }
+        }
+        const keyed = priorByKey.get(key) ?? [];
+        const legacyUnsequenced = keyed.filter((entry) => entry.version !== 2 || entry.sequence === undefined);
+        if (options.allowSequenceKeyFallback || priorBySequence.size === 0 || legacyUnsequenced.length > 0) {
+          return lookupMatchingEntries(options.allowSequenceKeyFallback || priorBySequence.size === 0 ? keyed : legacyUnsequenced, kind, identity, options);
+        }
+        // A missing sequence represents an interrupted or newly introduced call and runs live.
+        return { hit: false };
       }
-      const matches = current.filter(
-        (entry) => resumeContextMismatchReason(entry.identity, identity, options) === undefined,
-      );
-      if (matches.length === 1) return { hit: true, value: matches[0]!.result };
-      if (matches.length > 1) return { hit: false, reason: "multiple cached entries match this agent call" };
-      return { hit: false, reason: resumeContextMismatchReason(current[0]!.identity, identity, options) };
+      return lookupMatchingEntries(priorByKey.get(key) ?? [], kind, identity, options);
     },
-    async record(key, result, identity) {
-      const entry: JournalEntryV2 = { version: 2, key, result, identity };
-      if (writePath) {
+    async record(key, result, identity, options = {}) {
+      const entry: JournalEntryV2 = {
+        version: 2,
+        kind: options.kind ?? "agent",
+        sequence: options.sequence,
+        key,
+        result,
+        identity,
+      };
+      if (!writePath) return { ok: true };
+      const append = async (): Promise<JournalRecordResult> => {
         try {
           await mkdir(dirname(writePath), { recursive: true });
           await appendFile(writePath, `${JSON.stringify(entry)}\n`, "utf8");
+          return { ok: true };
         } catch (error) {
-      return { ok: false, error: unknownErrorMessage(error) };
+          return { ok: false, error: unknownErrorMessage(error) };
         }
-      }
-      return { ok: true };
+      };
+      appendQueue = appendQueue.then(append, append);
+      return await appendQueue;
     },
   };
+}
+
+function lookupMatchingEntries(
+  entries: readonly JournalEntry[],
+  kind: string,
+  identity: unknown,
+  options: JournalLookupOptions,
+): JournalLookup {
+  if (entries.length === 0) return { hit: false };
+  const current = entries.filter(
+    (entry): entry is JournalEntryV2 => entry.version === 2 && journalEntryKind(entry) === kind,
+  );
+  if (current.length === 0) {
+    return {
+      hit: false,
+      reason: entries.some((entry) => entry.version === 2)
+        ? `journal entries belong to a different recorded call kind`
+        : "journal entry predates replay contract v2",
+    };
+  }
+
+  const matches = current.filter((entry) => recordedIdentityMismatchReason(entry.identity, identity, kind, options) === undefined);
+  if (matches.length === 1) return { hit: true, value: matches[0]!.result };
+  if (matches.length > 1) return { hit: false, reason: `multiple cached entries match this ${kind} call` };
+  return { hit: false, reason: recordedIdentityMismatchReason(current[0]!.identity, identity, kind, options) };
+}
+
+function recordedIdentityMismatchReason(
+  stored: unknown,
+  current: unknown,
+  kind: string,
+  options: JournalLookupOptions,
+): string | undefined {
+  if (kind === "agent") {
+    if (!isAgentResumeContext(stored) || !isAgentResumeContext(current)) {
+      return "journal entry predates effective replay identity";
+    }
+    return resumeContextMismatchReason(stored, current, options);
+  }
+
+  const normalizedStored = normalizeWorkflowSourceForEditedResume(stored, current, options);
+  const left = canonicalizeIdentity(normalizedStored);
+  const right = canonicalizeIdentity(current);
+  if (left.kind === "unverifiable" || right.kind === "unverifiable") {
+    return "recorded call identity could not be verified";
+  }
+  return left.value === right.value ? undefined : "recorded call identity changed";
+}
+
+function normalizeWorkflowSourceForEditedResume(
+  stored: unknown,
+  current: unknown,
+  options: JournalLookupOptions,
+): unknown {
+  if (!options.allowWorkflowSourceMismatch || !isRecord(stored) || !isRecord(current)) return stored;
+  if (stored.contract !== "workflow-api-v1" || current.contract !== "workflow-api-v1") return stored;
+  if (!isRecord(stored.workflow) || !isRecord(current.workflow)) return stored;
+  if (stored.workflow.kind !== "verified" || current.workflow.kind !== "verified") return stored;
+  if (typeof current.workflow.sourceFingerprint !== "string") return stored;
+  return {
+    ...stored,
+    workflow: { ...stored.workflow, sourceFingerprint: current.workflow.sourceFingerprint },
+  };
+}
+
+function journalEntryKind(entry: JournalEntryV2): string {
+  return entry.kind ?? "agent";
 }
 
 export async function pruneWorkflowJournals(cwd: string, keep = WORKFLOW_JOURNAL_KEEP): Promise<void> {
@@ -266,6 +380,8 @@ function isJournalEntry(value: unknown): value is JournalEntry {
   if (typeof value !== "object" || value === null) return false;
   const entry = value as {
     readonly version?: unknown;
+    readonly kind?: unknown;
+    readonly sequence?: unknown;
     readonly key?: unknown;
     readonly result?: unknown;
     readonly identity?: unknown;
@@ -273,7 +389,13 @@ function isJournalEntry(value: unknown): value is JournalEntry {
     readonly context?: unknown;
   };
   if (entry.version === 2) {
-    return typeof entry.key === "string" && "result" in entry && "identity" in entry;
+    return (
+      typeof entry.key === "string" &&
+      "result" in entry &&
+      "identity" in entry &&
+      (entry.kind === undefined || (typeof entry.kind === "string" && entry.kind.length > 0)) &&
+      (entry.sequence === undefined || (Number.isSafeInteger(entry.sequence) && Number(entry.sequence) > 0))
+    );
   }
   return (
     (entry.version === undefined || entry.version === 1) &&
@@ -281,6 +403,10 @@ function isJournalEntry(value: unknown): value is JournalEntry {
     "value" in entry &&
     (entry.context === undefined || isLegacyAgentResumeContext(entry.context))
   );
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 function isLegacyAgentResumeContext(value: unknown): boolean {

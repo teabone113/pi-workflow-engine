@@ -44,6 +44,7 @@ import { registerWorkflowRunCommand, WorkflowRunController } from "./src/workflo
 import { completeCurrentArgument, splitArgumentPrefix } from "./src/command-completions.ts";
 import { assertSupportedPiVersion } from "./src/pi-compat.ts";
 import { formatWorkflowInspection, workflowInspectionSnapshot } from "./src/ui/workflow-format.ts";
+import { WorkflowGatePauseError } from "./src/gate.ts";
 
 /** Extension root (this file lives in <repo>/.pi/extensions/pi-workflow-engine/index.ts). */
 const EXTENSION_DIR = fileURLToPath(new URL(".", import.meta.url));
@@ -142,7 +143,7 @@ const WORKFLOW_OPTION_COMPLETIONS = [
   { value: "--perf", description: "Collect workflow performance metrics" },
   { value: "--result-viewer", description: "Open supported result viewers" },
   { value: "--no-result-viewer", description: "Skip supported result viewers" },
-  { value: "--resume-edited", description: "Allow resume after workflow source edits" },
+  { value: "--resume-edited", description: "Allow key-only resume after workflow source/order edits" },
   { value: "--concurrency=", description: "Set the global subagent concurrency cap" },
   { value: "--parallel-limit=", description: "Set the parallel submission limit" },
   { value: "--max-agents=", description: "Set the maximum admitted live agents" },
@@ -150,6 +151,7 @@ const WORKFLOW_OPTION_COMPLETIONS = [
   { value: "--agent-retries=", description: "Set retries for each agent call" },
   { value: "--budget=", description: "Set the workflow output-token budget" },
   { value: "--resume=", description: "Resume from a retained workflow run ID" },
+  { value: "--resume-rerun-effects", description: "Allow missing manual-effect run steps to execute on resume" },
 ] as const;
 
 async function workflowArgumentCompletions(argumentPrefix: string): Promise<AutocompleteItem[] | null> {
@@ -274,6 +276,7 @@ const INVALID_MAX_AGENTS_OPTION = "--max-agents requires an integer";
 const INVALID_AGENT_TIMEOUT_OPTION = "--agent-timeout-ms requires an integer";
 const INVALID_AGENT_RETRIES_OPTION = "--agent-retries requires an integer";
 const INVALID_EDITED_RESUME_OPTION = "--resume-edited requires --resume <run-id>";
+const INVALID_EFFECT_RESUME_OPTION = "--resume-rerun-effects requires --resume <run-id>";
 
 function parseWorkflowOptions(input: string): { args: string; options: WorkflowRunOptions; refreshDiscovery?: boolean; optionErrors?: string[] } {
   const tokens = input.split(/\s+/).filter(Boolean);
@@ -297,6 +300,10 @@ function parseWorkflowOptions(input: string): { args: string; options: WorkflowR
     }
     if (token === "--resume-edited") {
       options.resumeEditedWorkflow = true;
+      continue;
+    }
+    if (token === "--resume-rerun-effects") {
+      options.resumeRerunEffects = true;
       continue;
     }
     if (token === "--result-viewer" || token === "--review-viewer") {
@@ -411,6 +418,7 @@ function parseWorkflowOptions(input: string): { args: string; options: WorkflowR
     kept.push(token);
   }
   if (options.resumeEditedWorkflow && !options.resumeFromRunId) optionErrors.push(INVALID_EDITED_RESUME_OPTION);
+  if (options.resumeRerunEffects && !options.resumeFromRunId) optionErrors.push(INVALID_EFFECT_RESUME_OPTION);
   return { args: kept.join(" ").trim(), options, refreshDiscovery: refreshDiscovery || undefined, optionErrors: optionErrors.length > 0 ? optionErrors : undefined };
 }
 
@@ -441,7 +449,8 @@ The script must start with export const meta = { ... } and default-export an asy
 Use the injected Type object for schemas. Do not import anything or use dynamic import().
 Set profile to "small", "medium", or "big" on each agent() call; use explicit model/thinkingLevel only for an intentional override.
 Always pass a plain string as the first api.agent() argument; build prompts with template strings before calling agent().
-If using \`isolation: "worktree"\`, remember api.agent() returns \`{ result, patch, changed }\`; read \`.result\` for the agent answer and \`.patch\` for the diff.
+If using \`isolation: "worktree"\`, remember api.agent() returns \`{ result, patch, changed }\`; read \`.result\` for the agent answer and \`.patch\` for the diff. Add narrow workspace-relative \`writeAllow\` globs for mutating agents.
+Use the recorded \`run()\`, \`now()\`, \`random()\`, \`uuid()\`, \`artifact()\`, and \`gate()\` primitives for resumable effects, nondeterminism, outputs, and owner approval; every run step requires an explicit effect classification.
 When the run is budgeted, guard expensive loops with \`while (api.budget.total && api.budget.remaining() > N) { ... }\`; api.agent() throws once the budget is spent.
 Subagents receive no skills by default. When the brief asks for a skill or a stage clearly benefits from one, pass \`skills: ["skill-name"]\` on that agent call only.
 ${ADAPTIVE_WORKFLOW_GUIDANCE}
@@ -452,6 +461,8 @@ export interface WorkflowToolRequestParams {
   readonly name?: string;
   readonly script?: string;
   readonly resumeFromRunId?: string;
+  readonly resumeEditedWorkflow?: boolean;
+  readonly resumeRerunEffects?: boolean;
   readonly background?: boolean;
 }
 
@@ -726,7 +737,15 @@ export default function workflowEngine(pi: ExtensionAPI, shortcuts: DynamaxShort
       }
 
       const effectiveOptions = invocation === direct ? directOptions : resolveWorkflowRunOptions(invocation.options);
-      await sendResolvedWorkflowResult(pi, ctx, invocation.name, mod, invocation.args, effectiveOptions, perfRecorder, reviewSessions);
+      try {
+        await sendResolvedWorkflowResult(pi, ctx, invocation.name, mod, invocation.args, effectiveOptions, perfRecorder, reviewSessions);
+      } catch (error) {
+        if (error instanceof WorkflowGatePauseError) {
+          ctx.ui.notify(error.message, "warning");
+          return;
+        }
+        throw error;
+      }
     },
   });
 
@@ -753,13 +772,15 @@ function registerWorkflowTool(
       "Inline scripts may compose registered workflows in-process via `api.workflow(\"<name>\", args)` (e.g. `await api.workflow(\"code-review\", \"HEAD~3\")`); it returns the sub-workflow's result and nests one level only.",
       "Subagents receive no skills by default. In inline workflows, pass `skills: [\"skill-name\"]` per `agent()` call when the user asks for a skill or a stage should use one; grant only the needed skills.",
       "Always pass a plain string as the first `api.agent()` argument; build prompts with template strings before calling agent().",
-      "When using `isolation: \"worktree\"`, `api.agent()` returns `{ result, patch, changed }`; use `.result` for the answer and `.patch` for the isolated diff.",
+      "When using `isolation: \"worktree\"`, `api.agent()` returns `{ result, patch, changed }`; use `.result` for the answer and `.patch` for the isolated diff. Use narrow workspace-relative `writeAllow` globs for mutating agents.",
+      "Use `api.run()`, `now()`, `random()`, `uuid()`, `artifact()`, and `gate()` when effects, nondeterminism, outputs, or explicit owner approval must be durable across resume; every run step requires an explicit effect classification.",
       "If an inline subagent needs grep/find/code-search helpers, use `tools: [\"read\", \"bash\", \"grep\", \"find\", \"ls\"]` plus `toolHints: [\"search\"]` so installed tools such as ast-grep, mgrep, ffgrep, or fffind are discovered dynamically.",
       "`api.budget` exposes `{ total, spent(), remaining() }` (output tokens). When the run is budgeted, scale fleets from `budget.total` and guard loops with `while (budget.total && budget.remaining() > N) { await api.agent(...) }`; `api.agent()` throws once the ceiling is reached.",
       ADAPTIVE_WORKFLOW_GUIDANCE,
       "Set background: true only when the user explicitly wants the workflow to continue after this tool call; the tool returns a durable run ID and completion is delivered later.",
       "Set autoResumeOnUsageLimit: true only for an explicitly backgrounded workflow when the user wants bounded automatic continuation after a recognized provider usage window.",
-      "Set resumeEditedWorkflow: true only with resumeFromRunId when the user explicitly accepts reusing behaviorally identical calls after workflow source edits.",
+      "Set resumeEditedWorkflow: true only with resumeFromRunId when the user explicitly accepts key-only fallback after workflow source or recorded-call order edits.",
+      "Set resumeRerunEffects: true only with resumeFromRunId and only after the user verifies a missing manual-effect run step did not complete.",
       "Every workflow tool call must provide exactly one of `name` or `script`, never both.",
     ],
     parameters: Type.Object({
@@ -810,7 +831,10 @@ function registerWorkflowTool(
       perf: Type.Optional(Type.Boolean({ description: "Include workflow performance timing aggregates in the result details" })),
       resumeFromRunId: Type.Optional(Type.String({ minLength: 1, description: "Workflow run id to resume from by replaying matching completed agent results" })),
       resumeEditedWorkflow: Type.Optional(
-        Type.Boolean({ description: "With resumeFromRunId, ignore only workflow-source fingerprint changes while retaining all other replay checks" }),
+        Type.Boolean({ description: "With resumeFromRunId, allow key-only fallback after workflow source or recorded-call order edits" }),
+      ),
+      resumeRerunEffects: Type.Optional(
+        Type.Boolean({ description: "With resumeFromRunId, explicitly allow missing manual-effect run steps to execute" }),
       ),
       background: Type.Optional(Type.Boolean({ description: "Return a durable run ID immediately and deliver completion to this conversation later" })),
     }),
@@ -853,6 +877,12 @@ function registerWorkflowTool(
           details: { error: "invalid_edited_workflow_resume" },
         };
       }
+      if (params.resumeRerunEffects && !resumeFromRunId) {
+        return {
+          content: [{ type: "text", text: "resumeRerunEffects requires resumeFromRunId." }],
+          details: { error: "invalid_effect_resume" },
+        };
+      }
       if (params.background) {
         const unavailable = backgroundUnavailableResult(ctx.mode);
         if (unavailable) return unavailable;
@@ -872,6 +902,7 @@ function registerWorkflowTool(
         perf: params.perf,
         resumeFromRunId,
         resumeEditedWorkflow: params.resumeEditedWorkflow,
+        resumeRerunEffects: params.resumeRerunEffects,
         signal,
       });
       const perfRecorder = await createInvocationPerf(runOptions);
@@ -923,7 +954,27 @@ function registerWorkflowTool(
           },
         });
       }
-      const execution = await executeResolvedWorkflow(pi, ctx, resultName, mod, resultArgs, runOptions, perfRecorder);
+      let execution: WorkflowExecution;
+      try {
+        execution = await executeResolvedWorkflow(pi, ctx, resultName, mod, resultArgs, runOptions, perfRecorder);
+      } catch (error) {
+        if (error instanceof WorkflowGatePauseError) {
+          return {
+            content: [{ type: "text", text: error.message }],
+            details: {
+              paused: true,
+              state: "paused",
+              reason: error.gate.reason,
+              gate: error.gate.name,
+              reviewedDigest: error.gate.reviewedDigest,
+              recordedSequence: error.gate.sequence,
+              runId: error.runId,
+              answerCommand: `/workflow:answer ${error.runId} <choice>${error.gate.textPrompt ? " <text>" : " [text]"}`,
+            },
+          };
+        }
+        throw error;
+      }
       reviewSessions.remember(ctx, execution, runOptions);
       return {
         content: [{

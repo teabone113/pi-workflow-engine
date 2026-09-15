@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { Static, TSchema } from "typebox";
 import { bindParallel, bindPipeline, Semaphore } from "./concurrency.ts";
@@ -6,7 +7,7 @@ import { defaultAgentRetryScheduler, type AgentRetryScheduler } from "./agent-re
 import { resolveWorkflowModelProfiles, type ResolvedWorkflowModelProfiles } from "./model-profiles.ts";
 import { abortReason, isWorkflowPauseError, linkAbortSignal, throwIfAborted } from "./cancellation.ts";
 import { createBudget } from "./budget.ts";
-import { runAgent, type AgentExecutionOptions, type RunContext } from "./agent-runner.ts";
+import { runAgent, type AgentExecutionOptions, type CreateAgentSession, type RunContext } from "./agent-runner.ts";
 import { ProgressTracker } from "./progress.ts";
 import { createPerfRecorder, type PerfSink, type PerfSnapshot } from "./perf.ts";
 import { createWorkflowUsageRecorder, type WorkflowUsageSink } from "./usage.ts";
@@ -36,6 +37,30 @@ import {
   createProviderUsageLimitPauseRecord,
   WorkflowProviderUsageLimitError,
 } from "./provider-usage-limit.ts";
+import { recorderForJournal, WorkflowRecorder, workflowRecordedIdentity } from "./recorded.ts";
+import {
+  executeRunStep,
+  isRunStepResult,
+  resolveRunStep,
+  runStepIdentity,
+  runStepJournalKey,
+  WorkflowManualEffectResumeError,
+} from "./run-step.ts";
+import {
+  artifactIdentity,
+  artifactJournalKey,
+  prepareWorkflowArtifact,
+  storeWorkflowArtifact,
+  validateWorkflowArtifact,
+  WorkflowArtifactIntegrityError,
+} from "./artifact.ts";
+import {
+  gatePauseData,
+  isGateDecision,
+  prepareWorkflowGate,
+  requestGateDecision,
+  WorkflowGatePauseError,
+} from "./gate.ts";
 
 /** The workflow-facing slice of the progress tracker (satisfied by `ProgressTracker`). */
 export interface WorkflowProgress {
@@ -68,6 +93,8 @@ type Outcome<T> =
   | { readonly ok: false; readonly error: unknown };
 
 export interface WorkflowEngineDependencies {
+  /** Test/programmatic session factory override; production uses Pi's in-process session services. */
+  readonly createSession?: CreateAgentSession;
   readonly worktrees?: WorktreeRegistry;
   readonly retryScheduler?: AgentRetryScheduler;
   readonly modelProfiles?: ResolvedWorkflowModelProfiles;
@@ -144,6 +171,12 @@ export async function runResolvedWorkflow(
     }
 
     const journal = await createWorkflowJournal({ resumePath, writePath: journalPath });
+    const recorder = new WorkflowRecorder(journal, {
+      resumeEditedWorkflow: resolvedOptions.resumeEditedWorkflow,
+      onSequence(sequence) {
+        durableRun.updateRecordedPosition(sequence, progress.snapshot().currentPhase);
+      },
+    });
     durableRun.transition({ state: "running", progress: progress.snapshot() });
     await durableRun.flush().catch(() => undefined);
     await notifyLifecycleObserver(progress, "run metadata callback", () =>
@@ -170,6 +203,9 @@ export async function runResolvedWorkflow(
       agentRetries: resolvedOptions.agentRetries,
       pauseOnProviderUsageLimit: resolvedOptions.background !== undefined,
       resumeEditedWorkflow: resolvedOptions.resumeEditedWorkflow,
+      resumeRerunEffects: resolvedOptions.resumeRerunEffects,
+      runId,
+      ownerContext: ctx,
       retryScheduler: dependencies.retryScheduler ?? defaultAgentRetryScheduler,
       modelProfiles,
       progress,
@@ -178,7 +214,9 @@ export async function runResolvedWorkflow(
       usage,
       budget,
       journal,
+      recorder,
       worktrees,
+      createSession: dependencies.createSession,
     };
 
     // perf.total_ms wraps the whole tree: sub-workflows run inside this span via api.workflow().
@@ -226,6 +264,16 @@ export async function runResolvedWorkflow(
   function persistTerminalWorkflowError(error: unknown): void {
     const pauseError = backgroundPauseError(error, ctx.signal, resolvedOptions.signal);
     if (pauseError) {
+      if (pauseError instanceof WorkflowGatePauseError) {
+        durableRun.transition({
+          state: "paused",
+          progress: progress.snapshot(),
+          message: pauseError.message,
+          reason: pauseError.gate.reason,
+          gate: pauseError.gate,
+        });
+        return;
+      }
       if (pauseError instanceof WorkflowProviderUsageLimitError) {
         if (resolvedOptions.background === undefined) {
           durableRun.transition({
@@ -404,6 +452,92 @@ export async function runWorkflowWithContext(
   };
 
   const agent = createWorkflowAgent(rc, scope, mod, resumeContext);
+  const recorder = rc.recorder ?? recorderForJournal(rc.journal, {
+    resumeEditedWorkflow: rc.resumeEditedWorkflow,
+  });
+  const recordedIdentity = (call: unknown) => workflowRecordedIdentity(resumeContext.workflow, call);
+
+  const run: WorkflowApi["run"] = async (command, runOpts) => {
+    throwIfAborted(rc.signal);
+    const step = resolveRunStep(rc.cwd, command, runOpts);
+    return await recorder.recorded(
+      "run",
+      runStepJournalKey(step),
+      recordedIdentity(runStepIdentity(step)),
+      () => executeRunStep(step, rc.signal),
+      {
+        validate: isRunStepResult,
+        beforeLive(reservation) {
+          if (recorder.isResuming && step.effect === "manual" && !rc.resumeRerunEffects) {
+            const label = step.callerKey ?? reservation.key;
+            throw new WorkflowManualEffectResumeError(
+              `Refusing to re-run manual-effect step "${label}" at recorded sequence ${reservation.sequence} because its completed journal entry is missing. Re-run with --resume-rerun-effects only after verifying the effect did not complete.`,
+            );
+          }
+        },
+      },
+    );
+  };
+
+  const now: WorkflowApi["now"] = async () => {
+    throwIfAborted(rc.signal);
+    const ordinal = recorder.nextKindOrdinal("now");
+    return await recorder.recorded("now", `now:${ordinal}`, recordedIdentity({ primitive: "now", ordinal }), () => Date.now(), {
+      validate: (value) => typeof value === "number" && Number.isFinite(value),
+    });
+  };
+  const random: WorkflowApi["random"] = async () => {
+    throwIfAborted(rc.signal);
+    const ordinal = recorder.nextKindOrdinal("random");
+    return await recorder.recorded("random", `random:${ordinal}`, recordedIdentity({ primitive: "random", ordinal }), () => Math.random(), {
+      validate: (value) => typeof value === "number" && value >= 0 && value < 1,
+    });
+  };
+  const uuid: WorkflowApi["uuid"] = async () => {
+    throwIfAborted(rc.signal);
+    const ordinal = recorder.nextKindOrdinal("uuid");
+    return await recorder.recorded("uuid", `uuid:${ordinal}`, recordedIdentity({ primitive: "uuid", ordinal }), () => randomUUID(), {
+      validate: (value) => typeof value === "string" && /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value),
+    });
+  };
+  const artifact: WorkflowApi["artifact"] = async (name, content, artifactOpts) => {
+    throwIfAborted(rc.signal);
+    if (!rc.runId) throw new Error("artifact() requires a top-level workflow run id");
+    const prepared = prepareWorkflowArtifact(name, content, artifactOpts);
+    const identity = recordedIdentity(artifactIdentity(prepared));
+    const reservation = recorder.reserve("artifact", artifactJournalKey(prepared));
+    const cached = recorder.lookup(reservation, identity);
+    if (cached.hit && !await validateWorkflowArtifact(rc.cwd, cached.value)) {
+      throw new WorkflowArtifactIntegrityError(`Replayed artifact ${prepared.name} failed integrity validation.`);
+    }
+    const stored = await storeWorkflowArtifact(rc.cwd, rc.runId, prepared);
+    await recorder.record(reservation, stored, identity);
+    return stored;
+  };
+  const gate: WorkflowApi["gate"] = async (name, gateOpts) => {
+    throwIfAborted(rc.signal);
+    const prepared = prepareWorkflowGate(opts.progressNamespace, name, gateOpts);
+    const reservation = recorder.reserve("gate", prepared.key);
+    const identity = recordedIdentity(prepared.identity);
+    for (const item of prepared.review) {
+      if (typeof item !== "string" && !await validateWorkflowArtifact(rc.cwd, item)) {
+        throw new WorkflowArtifactIntegrityError(`Gate ${name} received artifact ${item.name} that failed integrity validation.`);
+      }
+    }
+    const cached = recorder.lookup(reservation, identity);
+    if (cached.hit && isGateDecision(cached.value, prepared)) {
+      await recorder.record(reservation, cached.value, identity);
+      return cached.value;
+    }
+    const decision = await requestGateDecision(rc.ownerContext, prepared);
+    if (!decision) {
+      if (!rc.runId) throw new Error("gate() requires a top-level workflow run id");
+      throw new WorkflowGatePauseError(rc.runId, gatePauseData(prepared, reservation, identity));
+    }
+    throwIfAborted(rc.signal);
+    await recorder.record(reservation, decision, identity);
+    return decision;
+  };
 
   const workflow: WorkflowApi["workflow"] =
     depth >= 1
@@ -434,6 +568,12 @@ export async function runWorkflowWithContext(
 
   const api: WorkflowApi = {
     agent,
+    run,
+    now,
+    random,
+    uuid,
+    artifact,
+    gate,
     workflow,
     parallel: bindParallel({
       signal: rc.signal,

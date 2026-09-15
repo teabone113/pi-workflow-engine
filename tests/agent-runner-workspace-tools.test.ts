@@ -11,7 +11,7 @@ import {
 } from "../.pi/extensions/pi-workflow-engine/src/budget.ts";
 import type { WorkflowJournal } from "../.pi/extensions/pi-workflow-engine/src/journal.ts";
 import { WorktreeRegistry } from "../.pi/extensions/pi-workflow-engine/src/worktree.ts";
-import { resumeContextMismatchReason, type AgentResumeContext } from "../.pi/extensions/pi-workflow-engine/src/resume-context.ts";
+import { isAgentResumeContext, resumeContextMismatchReason, type AgentResumeContext } from "../.pi/extensions/pi-workflow-engine/src/resume-context.ts";
 import {
   matchesAgentToolHint,
   WorkflowToolHintUnavailableError,
@@ -240,10 +240,12 @@ test("isolated replay binds to prepared contents and same-tree commit identity",
   const journal: WorkflowJournal = {
     lookup(key, identity) {
       if (!stored || stored.key !== key) return { hit: false };
+      if (!isAgentResumeContext(identity)) throw new Error("expected agent resume identity");
       const mismatch = resumeContextMismatchReason(stored.identity, identity);
       return mismatch ? { hit: false, reason: mismatch } : { hit: true, value: stored.result };
     },
     async record(key, result, identity) {
+      if (!isAgentResumeContext(identity)) throw new Error("expected agent resume identity");
       stored = { key, result, identity };
       return { ok: true };
     },

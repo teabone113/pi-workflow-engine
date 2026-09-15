@@ -42,6 +42,12 @@ function scriptedApi(responses: readonly unknown[], args: string): ScriptedApi {
     phases,
     events,
     agent,
+    run: async () => { throw new Error("run steps are disabled in this fixture"); },
+    now: async () => 0,
+    random: async () => 0,
+    uuid: async () => "00000000-0000-4000-8000-000000000000",
+    artifact: async () => { throw new Error("artifacts are disabled in this fixture"); },
+    gate: async () => { throw new Error("gates are disabled in this fixture"); },
     workflow: async () => {
       throw new Error("sub-workflows are disabled in this fixture");
     },

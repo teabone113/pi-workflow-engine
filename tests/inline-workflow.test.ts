@@ -12,6 +12,12 @@ function createFakeApi(overrides: Partial<WorkflowApi> = {}, onAgent?: (opts: Ag
 
   return {
     agent,
+    run: async () => { throw new Error("run steps are not enabled in this context"); },
+    now: async () => 0,
+    random: async () => 0,
+    uuid: async () => "00000000-0000-4000-8000-000000000000",
+    artifact: async () => { throw new Error("artifacts are not enabled in this context"); },
+    gate: async () => { throw new Error("gates are not enabled in this context"); },
     workflow: async () => {
       throw new Error("sub-workflows are not enabled in this context");
     },
@@ -54,6 +60,35 @@ export default async function run({ phase, args }) {
   assert.ok(mod.source.kind === "fingerprint" && mod.source.fingerprint.length > 0);
   assert.deepEqual(result, { summary: "args:hello" });
   assert.deepEqual(phases, ["Run"]);
+});
+
+test("inline workflows receive the additive recorded-call primitives", async () => {
+  const mod = compileInlineWorkflow(`
+export const meta = { name: "primitive-inline", description: "Primitive inline" };
+export default async function run({ now, random, uuid, artifact, gate }) {
+  return {
+    now: await now(),
+    random: await random(),
+    uuid: await uuid(),
+    artifact: await artifact("out.txt", "ok"),
+    gate: await gate("ship", { review: ["ok"] }),
+  };
+}
+`);
+  const result = await mod.default(createFakeApi({
+    now: async () => 12,
+    random: async () => 0.25,
+    uuid: async () => "00000000-0000-4000-8000-000000000001",
+    artifact: async () => ({ name: "out.txt", path: "artifact", sha256: "0".repeat(64), bytes: 2 }),
+    gate: async () => ({ choice: "approve", reviewedDigest: "1".repeat(64), decidedAt: 1, by: "ui" }),
+  }));
+  assert.deepEqual(result, {
+    now: 12,
+    random: 0.25,
+    uuid: "00000000-0000-4000-8000-000000000001",
+    artifact: { name: "out.txt", path: "artifact", sha256: "0".repeat(64), bytes: 2 },
+    gate: { choice: "approve", reviewedDigest: "1".repeat(64), decidedAt: 1, by: "ui" },
+  });
 });
 
 test("compileInlineWorkflow injects Type for structured agent schemas", async () => {

@@ -55,6 +55,12 @@ function createScriptedApi(responses: unknown[], args = ""): ScriptedApi {
     logs,
     events,
     agent,
+    run: async () => { throw new Error("run steps are not enabled in these tests"); },
+    now: async () => 0,
+    random: async () => 0,
+    uuid: async () => "00000000-0000-4000-8000-000000000000",
+    artifact: async () => { throw new Error("artifacts are not enabled in these tests"); },
+    gate: async () => { throw new Error("gates are not enabled in these tests"); },
     workflow: async () => {
       throw new Error("sub-workflows are not enabled in these tests");
     },

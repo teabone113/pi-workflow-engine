@@ -10,6 +10,7 @@ import type { WorkflowProgressSnapshot } from "./progress-types.ts";
 import type { LoadedWorkflow, WorkflowSourceIdentity } from "./types.ts";
 import { isWorkflowUsageSnapshot, type WorkflowUsageSnapshot } from "./usage.ts";
 import { unknownErrorMessage } from "./unknown-error.ts";
+import { isWorkflowGatePauseData, type WorkflowGatePauseData } from "./gate.ts";
 import {
   createPersistedWorkflowBackground,
   isPersistedWorkflowBackground,
@@ -60,6 +61,8 @@ export interface PersistedWorkflowRunOptions {
   readonly usageLimitAttempt?: number;
   /** Explicit edited-source replay opt-in. Omitted on older records. */
   readonly resumeEditedWorkflow?: boolean;
+  /** Explicit manual-effect rerun opt-in. Omitted on older records. */
+  readonly resumeRerunEffects?: boolean;
   readonly budget: number | null;
   /** Whether replay would require redacted invocation arguments. Omitted on legacy records. */
   readonly argumentsPresent?: boolean;
@@ -99,6 +102,10 @@ interface WorkflowRunRecordBase {
   readonly createdAt: number;
   readonly updatedAt: number;
   readonly progress: WorkflowProgressSnapshot;
+  /** Highest invocation-order recorded-call sequence reached by this run. */
+  readonly highestSequence?: number;
+  /** Current phase copied outside the compact progress payload for lifecycle surfaces. */
+  readonly currentPhase?: string;
   readonly usage?: WorkflowUsageSnapshot;
   readonly background?: PersistedWorkflowBackground;
 }
@@ -106,7 +113,7 @@ interface WorkflowRunRecordBase {
 export type WorkflowRunRecord = WorkflowRunRecordBase & (
   | { readonly state: "queued"; readonly startedAt?: number; readonly endedAt?: never; readonly result?: never; readonly message?: never }
   | { readonly state: "running"; readonly startedAt: number; readonly endedAt?: never; readonly result?: never; readonly message?: never }
-  | { readonly state: "paused"; readonly startedAt: number; readonly endedAt?: never; readonly result?: never; readonly message: string; readonly pause?: WorkflowRunPause }
+  | { readonly state: "paused"; readonly startedAt: number; readonly endedAt?: never; readonly result?: never; readonly message: string; readonly reason?: string; readonly pause?: WorkflowRunPause; readonly gate?: WorkflowGatePauseData }
   | { readonly state: "completed"; readonly startedAt: number; readonly endedAt: number; readonly usage: WorkflowUsageSnapshot; readonly result: WorkflowRunStoredResult; readonly message?: never }
   | { readonly state: "failed" | "stopped"; readonly startedAt: number; readonly endedAt: number; readonly usage: WorkflowUsageSnapshot; readonly result?: never; readonly message: string }
 );
@@ -114,7 +121,7 @@ export type WorkflowRunRecord = WorkflowRunRecordBase & (
 export type WorkflowRunTransition =
   | { readonly state: "queued"; readonly progress: WorkflowProgressSnapshot; readonly at?: number }
   | { readonly state: "running"; readonly progress: WorkflowProgressSnapshot; readonly at?: number }
-  | { readonly state: "paused"; readonly progress: WorkflowProgressSnapshot; readonly message: string; readonly pause?: WorkflowRunPause; readonly at?: number }
+  | { readonly state: "paused"; readonly progress: WorkflowProgressSnapshot; readonly message: string; readonly reason?: string; readonly pause?: WorkflowRunPause; readonly gate?: WorkflowGatePauseData; readonly at?: number }
   | { readonly state: "completed"; readonly progress: WorkflowProgressSnapshot; readonly usage: WorkflowUsageSnapshot; readonly result: unknown; readonly at?: number }
   | { readonly state: "failed" | "stopped"; readonly progress: WorkflowProgressSnapshot; readonly usage: WorkflowUsageSnapshot; readonly error: unknown; readonly at?: number };
 
@@ -137,6 +144,8 @@ export function createWorkflowRunRecord(input: {
     createdAt: input.progress.startedAt,
     updatedAt: input.progress.startedAt,
     progress: compactWorkflowProgress(input.progress),
+    highestSequence: 0,
+    currentPhase: input.progress.currentPhase,
     background: createPersistedWorkflowBackground(input.options.background),
   };
 }
@@ -152,8 +161,24 @@ export function updateWorkflowRunProgress(
     ...record,
     updatedAt: at,
     progress: compact,
+    currentPhase: compact.currentPhase,
   };
   return compact.usage === undefined ? updated : { ...updated, usage: compact.usage };
+}
+
+export function updateWorkflowRunRecordedPosition(
+  record: WorkflowRunRecord,
+  sequence: number,
+  currentPhase: string,
+  at = Date.now(),
+): WorkflowRunRecord {
+  if (!Number.isSafeInteger(sequence) || sequence < 0) throw new Error("Workflow recorded sequence must be a non-negative integer.");
+  return {
+    ...record,
+    updatedAt: at,
+    highestSequence: Math.max(record.highestSequence ?? 0, sequence),
+    currentPhase: boundedText(currentPhase),
+  };
 }
 
 export function transitionWorkflowRun(record: WorkflowRunRecord, transition: WorkflowRunTransition): WorkflowRunRecord {
@@ -172,6 +197,8 @@ export function transitionWorkflowRun(record: WorkflowRunRecord, transition: Wor
     createdAt: record.createdAt,
     updatedAt: at,
     progress,
+    highestSequence: record.highestSequence,
+    currentPhase: progress.currentPhase,
     usage: progress.usage ?? record.usage,
     background: record.background,
   };
@@ -187,7 +214,9 @@ export function transitionWorkflowRun(record: WorkflowRunRecord, transition: Wor
         state: "paused",
         startedAt: record.startedAt ?? record.createdAt,
         message: persistedErrorMessage(transition.message),
+        reason: boundedText(transition.reason ?? transition.pause?.reason ?? transition.gate?.reason ?? transition.message),
         pause: transition.pause === undefined ? undefined : compactWorkflowRunPause(transition.pause),
+        gate: transition.gate === undefined ? undefined : compactWorkflowGatePause(transition.gate),
       };
     case "completed":
       return {
@@ -254,6 +283,7 @@ function persistedWorkflowRunOptions(
     usageLimitMaxDelayMs: options.usageLimitMaxDelayMs,
     usageLimitAttempt: options.usageLimitAttempt,
     resumeEditedWorkflow: options.resumeEditedWorkflow,
+    resumeRerunEffects: options.resumeRerunEffects,
     budget: options.budget,
     argumentsPresent,
     resultViewer: options.resultViewer,
@@ -457,6 +487,17 @@ function compactWorkflowRunPause(pause: WorkflowRunPause): WorkflowRunPause {
   };
 }
 
+function compactWorkflowGatePause(gate: WorkflowGatePauseData): WorkflowGatePauseData {
+  return {
+    ...gate,
+    reason: boundedText(gate.reason),
+    name: boundedText(gate.name),
+    key: boundedText(gate.key),
+    choices: gate.choices.map(boundedText),
+    textPrompt: gate.textPrompt === undefined ? undefined : boundedText(gate.textPrompt),
+  };
+}
+
 function boundedText(value: string): string {
   return value.length <= MAX_PERSISTED_TEXT ? value : `${value.slice(0, MAX_PERSISTED_TEXT - 1)}…`;
 }
@@ -470,23 +511,27 @@ export function isWorkflowRunRecord(value: unknown): value is WorkflowRunRecord 
   if (value.startedAt !== undefined && !isFiniteNumber(value.startedAt)) return false;
   if (value.endedAt !== undefined && !isFiniteNumber(value.endedAt)) return false;
   if (!isWorkflowProgressSnapshot(value.progress) || value.progress.runId !== value.runId) return false;
+  if (value.highestSequence !== undefined && (!Number.isSafeInteger(value.highestSequence) || Number(value.highestSequence) < 0)) return false;
+  if (value.currentPhase !== undefined && typeof value.currentPhase !== "string") return false;
   if (value.usage !== undefined && !isWorkflowUsageSnapshot(value.usage)) return false;
   if (value.result !== undefined && !isWorkflowRunStoredResult(value.result)) return false;
   if (value.message !== undefined && typeof value.message !== "string") return false;
+  if (value.reason !== undefined && typeof value.reason !== "string") return false;
   if (value.pause !== undefined && !isWorkflowRunPause(value.pause)) return false;
+  if (value.gate !== undefined && !isWorkflowGatePauseData(value.gate)) return false;
   if (value.background !== undefined && !isPersistedWorkflowBackground(value.background)) return false;
   switch (value.state) {
     case "queued":
-      return value.endedAt === undefined && value.result === undefined && value.message === undefined && value.pause === undefined;
+      return value.endedAt === undefined && value.result === undefined && value.message === undefined && value.reason === undefined && value.pause === undefined && value.gate === undefined;
     case "running":
-      return value.startedAt !== undefined && value.endedAt === undefined && value.result === undefined && value.message === undefined && value.pause === undefined;
+      return value.startedAt !== undefined && value.endedAt === undefined && value.result === undefined && value.message === undefined && value.reason === undefined && value.pause === undefined && value.gate === undefined;
     case "paused":
-      return value.startedAt !== undefined && value.endedAt === undefined && value.result === undefined && value.message !== undefined;
+      return value.startedAt !== undefined && value.endedAt === undefined && value.result === undefined && value.message !== undefined && !(value.pause !== undefined && value.gate !== undefined);
     case "completed":
-      return value.startedAt !== undefined && value.endedAt !== undefined && value.usage !== undefined && value.result !== undefined && value.message === undefined && value.pause === undefined;
+      return value.startedAt !== undefined && value.endedAt !== undefined && value.usage !== undefined && value.result !== undefined && value.message === undefined && value.reason === undefined && value.pause === undefined && value.gate === undefined;
     case "failed":
     case "stopped":
-      return value.startedAt !== undefined && value.endedAt !== undefined && value.usage !== undefined && value.result === undefined && value.message !== undefined && value.pause === undefined;
+      return value.startedAt !== undefined && value.endedAt !== undefined && value.usage !== undefined && value.result === undefined && value.message !== undefined && value.reason === undefined && value.pause === undefined && value.gate === undefined;
   }
 }
 
@@ -517,6 +562,7 @@ function isPersistedWorkflowRunOptions(value: unknown): value is PersistedWorkfl
     && !isIntegerInRange(value.usageLimitAttempt, 0, WORKFLOW_USAGE_LIMIT_ATTEMPTS_MAX)
   ) return false;
   if (value.resumeEditedWorkflow !== undefined && typeof value.resumeEditedWorkflow !== "boolean") return false;
+  if (value.resumeRerunEffects !== undefined && typeof value.resumeRerunEffects !== "boolean") return false;
   if (value.parallelSubmissionLimit !== null && !isFiniteNumber(value.parallelSubmissionLimit)) return false;
   if (value.budget !== null && !isFiniteNumber(value.budget)) return false;
   if (value.argumentsPresent !== undefined && typeof value.argumentsPresent !== "boolean") return false;

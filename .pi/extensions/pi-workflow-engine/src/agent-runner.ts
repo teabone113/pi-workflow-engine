@@ -25,6 +25,7 @@ import {
   WorkflowProviderError,
 } from "./agent-retry.ts";
 import { resolveAgentModelProfile } from "./model-profiles.ts";
+import { recorderForJournal } from "./recorded.ts";
 
 export type {
   AgentExecutionOptions,
@@ -63,6 +64,10 @@ export async function runAgent(
       ? opts
       : { ...opts, thinkingLevel: routing.thinkingLevel };
     const replay = createAgentReplayPlan(prompt, effectiveOpts);
+    const recorder = rc.recorder ?? recorderForJournal(rc.journal, {
+      resumeEditedWorkflow: rc.resumeEditedWorkflow,
+    });
+    const recordedCall = isReplayEnabled(replay) ? recorder.reserve("agent", replay.key) : undefined;
     if (!isReplayEnabled(replay)) assertWorkflowBudgetAvailable(rc.budget);
 
     const rowId = rc.progress.agentQueued(opts.phase, label);
@@ -94,6 +99,7 @@ export async function runAgent(
                 rowId,
                 tags,
                 admitLiveAgent: liveScope.admit,
+                recordedCall,
               });
             } catch (error) {
               if (!(error instanceof WorkflowProviderError) || !error.retryable) throw error;
@@ -114,7 +120,7 @@ export async function runAgent(
               await agentRc.retryScheduler.sleep(delayMs, agentRc.signal);
               continue;
             }
-            const settlement = await settleAgentAttempt({ rc: agentRc, label, tags, replay: attemptPlan, outcome });
+            const settlement = await settleAgentAttempt({ rc: agentRc, label, tags, replay: attemptPlan, outcome, recordedCall });
             if (settlement.kind === "retry-live") {
               attemptPlan = { kind: "off" };
               continue;

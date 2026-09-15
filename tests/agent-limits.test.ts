@@ -7,7 +7,7 @@ import {
 } from "../.pi/extensions/pi-workflow-engine/src/agent-limits.ts";
 import { WorkflowAbortError } from "../.pi/extensions/pi-workflow-engine/src/cancellation.ts";
 import type { WorkflowJournal } from "../.pi/extensions/pi-workflow-engine/src/journal.ts";
-import type { AgentResumeContext } from "../.pi/extensions/pi-workflow-engine/src/resume-context.ts";
+import { isAgentResumeContext, type AgentResumeContext } from "../.pi/extensions/pi-workflow-engine/src/resume-context.ts";
 import type { CreateAgentSession } from "../.pi/extensions/pi-workflow-engine/src/agent-runner.ts";
 import {
   DEFAULT_SESSION_MODEL,
@@ -158,6 +158,7 @@ test("a replay hit consumes neither a live-agent admission nor provider work", a
   const recordingJournal: WorkflowJournal = {
     lookup: () => ({ hit: false }),
     async record(key, result, identity) {
+      if (!isAgentResumeContext(identity)) throw new Error("expected agent resume identity");
       recorded = { key, result, identity };
       return { ok: true };
     },

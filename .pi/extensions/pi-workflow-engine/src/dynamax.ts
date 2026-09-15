@@ -73,6 +73,8 @@ Inline workflow rules:
 - Do not use import statements or dynamic import() in inline workflow scripts.
 - Set profile to "small", "medium", or "big" on each agent() call so routing remains explicit; use model/thinkingLevel only for an intentional override.
 - Subagents receive no skills by default. Add \`skills: ["skill-name"]\` per agent only when that stage should load that skill; grant the smallest useful set.
+- For mutating agents, prefer worktree isolation and add the narrowest useful workspace-relative \`writeAllow\` globs.
+- Use \`run()\`, \`now()\`, \`random()\`, \`uuid()\`, \`artifact()\`, and \`gate()\` when workflow effects, nondeterminism, artifacts, or owner approval must survive resume; classify every run effect explicitly.
 - Provide exactly one of workflow.name or workflow.script.
 
 ${ADAPTIVE_WORKFLOW_GUIDANCE}

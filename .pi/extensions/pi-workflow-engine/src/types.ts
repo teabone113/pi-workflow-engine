@@ -66,10 +66,12 @@ export interface WorkflowRunOptions {
   runId?: string;
   /** Internal origin metadata for an explicitly backgrounded tool invocation. */
   background?: WorkflowBackgroundOrigin;
-  /** Replay completed agent results from this prior run id when call and execution context still match. */
+  /** Replay completed recorded API calls from this prior run id when sequence, key, and identity match. */
   resumeFromRunId?: string;
-  /** Explicitly allow resume to ignore only a workflow-source fingerprint mismatch. */
+  /** Explicitly allow resume to ignore workflow-source and recorded-sequence ordering mismatches. */
   resumeEditedWorkflow?: boolean;
+  /** Explicitly allow a missing manual-effect run() step to execute during resume. */
+  resumeRerunEffects?: boolean;
   resultViewer?: "open" | "skip";
   /** Additional abort signal to compose with the host context signal. */
   signal?: AbortSignal;
@@ -155,6 +157,12 @@ export interface AgentOptions<S extends TSchema = TSchema> {
   /** Allowlist of concrete tool names the agent may use (e.g. ["read", "bash"]). */
   tools?: string[];
   /**
+   * Workspace-relative globs limiting edit/write and detected bash mutations. `**`
+   * crosses directories; `*` and `?` do not. `[]` is read-only; omission keeps
+   * the unrestricted historical behavior.
+   */
+  writeAllow?: readonly string[];
+  /**
    * Dynamically include installed tools matching semantic categories. "search"
    * matches local grep/find/code-search tools; "external-search" matches installed
    * web search, browsing, and URL extraction tools.
@@ -176,6 +184,59 @@ export interface AgentOptions<S extends TSchema = TSchema> {
   schema?: S;
 }
 
+export interface WorkflowRunStepOptions {
+  /** Stable disambiguator for commands whose command/cwd/env-key tuple is repeated. */
+  readonly key?: string;
+  /** Workspace-relative working directory. Defaults to the workflow workspace root. */
+  readonly cwd?: string;
+  readonly timeoutMs?: number;
+  readonly env?: Readonly<Record<string, string>>;
+  readonly expectExitCode?: number;
+  readonly effect: "idempotent" | "manual";
+}
+
+export interface WorkflowRunStepResult {
+  readonly ok: boolean;
+  readonly exitCode: number | null;
+  readonly stdout: string;
+  readonly stderr: string;
+  readonly durationMs: number;
+  readonly timedOut: boolean;
+}
+
+export interface WorkflowArtifactOptions {
+  /** Stable disambiguator when the same logical artifact name is emitted more than once. */
+  readonly key?: string;
+}
+
+export interface WorkflowArtifact {
+  readonly name: string;
+  /** Workspace-relative path below `.pi/.workflow-runs/<run-id>/artifacts/`. */
+  readonly path: string;
+  readonly sha256: string;
+  readonly bytes: number;
+}
+
+export interface WorkflowGateTextOptions {
+  readonly prompt: string;
+}
+
+export interface WorkflowGateOptions<C extends readonly string[] = readonly ["approve", "reject"]> {
+  readonly review: readonly (WorkflowArtifact | string)[];
+  readonly choices?: C;
+  readonly text?: WorkflowGateTextOptions;
+  readonly context?: string;
+  readonly timeoutMs?: number;
+}
+
+export interface WorkflowGateDecision<C extends string = string> {
+  readonly choice: C;
+  readonly text?: string;
+  readonly reviewedDigest: string;
+  readonly decidedAt: number;
+  readonly by: "ui" | "command";
+}
+
 /**
  * The primitives injected into every workflow run. A workflow is any module that
  * exports `meta` plus a default `async (api: WorkflowApi) => result`.
@@ -192,6 +253,21 @@ export interface WorkflowApi {
   agent<S extends TSchema>(prompt: string, opts: AgentOptions<S> & { schema: S }): Promise<Static<S>>;
   /** Run a subagent and return its final assistant text. */
   agent(prompt: string, opts?: AgentOptions): Promise<string>;
+  /** Execute one recorded workflow-owned shell command. Output is bounded to 50 KiB per stream. */
+  run(command: string, opts: WorkflowRunStepOptions): Promise<WorkflowRunStepResult>;
+  /** Return a recorded Unix epoch timestamp in milliseconds. */
+  now(): Promise<number>;
+  /** Return a recorded Math.random()-compatible value. */
+  random(): Promise<number>;
+  /** Return a recorded UUID. */
+  uuid(): Promise<string>;
+  /** Store recorded text or JSON below this run's artifact directory. */
+  artifact(name: string, content: string | unknown, opts?: WorkflowArtifactOptions): Promise<WorkflowArtifact>;
+  /** Pause for an explicit owner decision; cancellation and timeout never select a choice. */
+  gate<C extends readonly string[] = readonly ["approve", "reject"]>(
+    name: string,
+    opts: WorkflowGateOptions<C>,
+  ): Promise<WorkflowGateDecision<C[number]>>;
   /**
    * Run another registered workflow inline as a sub-step and return its result. The child shares
    * this run's concurrency cap, abort signal, and perf sink. Nests one level only: calling
